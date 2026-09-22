@@ -3401,7 +3401,15 @@ impl ScriptRuntime {
                 "history_clear" => return self.dispatch_history_stub(11),
                 "history_set" => return self.dispatch_history_stub(12),
                 "history_get_text" => return self.dispatch_history_stub(20),
-                "movie_play" => return self.ext_movie_play(assets, nls, resource_manager),
+                "movie_play" => {
+                    return self.ext_movie_play(
+                        assets,
+                        nls,
+                        resource_manager,
+                        sprites,
+                        task_system,
+                    );
+                }
                 "msp_set_loop_sp_ep" => {
                     return self.ext_msp_set_loop_sp_ep(
                         assets,
@@ -8372,6 +8380,8 @@ impl ScriptRuntime {
         assets: &CoreAssets,
         nls: Nls,
         resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+        task_system: Option<&mut TaskSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(2);
         if args.len() < 2 {
@@ -8385,20 +8395,93 @@ impl ScriptRuntime {
         let Some(resource_manager) = resource_manager else {
             return ExtCallOutcome::Value(0);
         };
-        match open_resource_variant(resource_manager, &name, MOVIE_EXTENSIONS) {
-            Ok(asset) => {
-                self.msprite_system.start_movie(asset.name.clone(), layer);
-                log::debug!(
-                    "[trace-msprite] movie_play layer={layer} asset={:?}",
-                    asset.name
-                );
-                ExtCallOutcome::Value(1)
-            }
+        let Some(sprites) = sprites else {
+            return ExtCallOutcome::Value(0);
+        };
+        let asset = match open_resource_variant(resource_manager, &name, MOVIE_EXTENSIONS) {
+            Ok(asset) => asset,
             Err(err) => {
                 log::warn!("[trace-msprite] movie_play name={name:?} open failed: {err}");
-                ExtCallOutcome::Value(0)
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        if let Some(old_anim) = self.game_sprite_animations.remove(&layer) {
+            if let Some(task_system) = task_system {
+                task_system.animation_release(old_anim);
             }
         }
+        let previous_movie = self
+            .msprite_system
+            .movie()
+            .map(|movie| (movie.layer, movie.handle));
+        if let Some((previous_layer, Some(handle))) = previous_movie {
+            if previous_layer != layer {
+                self.msprite_system.release(handle);
+                self.game_msprites.remove(&previous_layer);
+                if let Some(old) = self.game_sprites.remove(&previous_layer) {
+                    sprites.release(old);
+                }
+            }
+        }
+        if let Some(old_state) = self.game_msprites.remove(&layer) {
+            if let Some(handle) = old_state.handle {
+                self.msprite_system.release(handle);
+            }
+        }
+        if let Some(old) = self.game_sprites.remove(&layer) {
+            sprites.release(old);
+        }
+        let loaded = match self
+            .msprite_system
+            .load_movie(asset.name.clone(), asset.bytes)
+        {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                log::warn!("[trace-msprite] movie_play name={name:?} decode failed: {err}");
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        let (logical_width, logical_height) = self.logical_size();
+        let x = (logical_width as i32 - loaded.width as i32) / 2;
+        let y = (logical_height as i32 - loaded.height as i32) / 2;
+        let Some(sprite) = sprites.create_msprite(
+            loaded.handle,
+            loaded.width,
+            loaded.height,
+            loaded.rgba,
+            PalVec3::new(x, y, layer),
+            900_000_i32.saturating_add(layer),
+            loaded.name.clone(),
+        ) else {
+            self.msprite_system.release(loaded.handle);
+            return ExtCallOutcome::Value(0);
+        };
+        self.msprite_system.play(loaded.handle, 0);
+        self.game_sprites.insert(layer, sprite);
+        self.game_msprites.insert(
+            layer,
+            GameMSpriteState {
+                handle: Some(loaded.handle),
+                playing: true,
+                locked: false,
+                loop_mode: 0,
+                loop_start: 0,
+                loop_end: 0,
+                last_play: 0,
+                finished: false,
+            },
+        );
+        self.msprite_system
+            .start_movie(loaded.name.clone(), layer, loaded.handle);
+        log::debug!(
+            "[trace-msprite] movie_play layer={layer} asset={:?} size={}x{} pos=({}, {})",
+            loaded.name,
+            loaded.width,
+            loaded.height,
+            x,
+            y
+        );
+        ExtCallOutcome::Value(1)
     }
 
     fn ext_sp_wait_draw(&mut self) -> ExtCallOutcome {
