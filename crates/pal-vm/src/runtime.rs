@@ -14,7 +14,7 @@ use crate::audio::{AudioHandle, AudioSystem, PalSoundGroup, PalVolume};
 use crate::config::{ini_graphics_size, parse_ini_nls, IniFile, IniValue};
 use crate::effect::PalEffectSystem;
 use crate::font::PalFontSystem;
-use crate::image::{decode_image_with_resolver, DecodedImage};
+use crate::image::{decode_image, decode_image_with_resolver, DecodedImage};
 use crate::input::{PalInputState, PalMouseButton};
 use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
 use crate::scene::{FrameScene, SceneTextureId, SolidQuad};
@@ -629,6 +629,9 @@ struct TextSubsystemState {
     /// concrete text sprites; keep them until the next ADV text surface exists.
     pending_alpha: Vec<PendingAlphaAction>,
     dirty: bool,
+    show_wait_mark: bool,
+    wait_mark_sheet: Option<DecodedImage>,
+    wait_mark_missing: bool,
 }
 
 impl TextSubsystemState {
@@ -710,6 +713,9 @@ impl Default for TextSubsystemState {
             base_image: None,
             pending_alpha: Vec::new(),
             dirty: false,
+            show_wait_mark: false,
+            wait_mark_sheet: None,
+            wait_mark_missing: false,
         }
     }
 }
@@ -1030,6 +1036,9 @@ impl ScriptRuntime {
         );
         self.system_state
             .set_logical_size(width as i32, height as i32);
+        if let Some(effect) = ini_first_int(&ini, "def_font_effect") {
+            self.font_state.set_effect(effect.max(0) as u16);
+        }
         self.system_ini = Some(ini);
     }
 
@@ -1192,6 +1201,10 @@ impl ScriptRuntime {
         self.wait_task_kind = None;
         if let Some(pc) = self.status.pc() {
             self.status = RuntimeStatus::Running { pc };
+        }
+        if matches!(old_status, RuntimeStatus::WaitClick { .. }) {
+            self.text_state.show_wait_mark = false;
+            self.text_state.dirty = true;
         }
         if debug_vm_enabled() || matches!(old_status, RuntimeStatus::WaitClick { .. }) {
             log::debug!(
@@ -1413,7 +1426,7 @@ impl ScriptRuntime {
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         sprites: &mut SpriteSystem,
     ) {
         self.sync_adv_button_chrome_visibility(sprites);
@@ -1442,7 +1455,10 @@ impl ScriptRuntime {
                 .pal_time_ms
                 .wrapping_sub(self.text_state.reveal_start_ms)
                 >= self.text_state.reveal_duration_ms;
-        if !self.text_state.dirty && !self.text_state.reveal_enabled {
+        if !self.text_state.dirty
+            && !self.text_state.reveal_enabled
+            && !self.text_state.show_wait_mark
+        {
             return;
         }
         let log_sync = self.text_state.dirty;
@@ -1497,8 +1513,33 @@ impl ScriptRuntime {
         let wrap_width = self.text_state.init_text_width().max(1) as u32;
         let (panel_text_width, panel_text_height, full_lines) =
             measure_wrapped_text(&self.font_state, &full_text, wrap_width);
-        let (text_width, text_height, text_rgba) =
+        let (mut text_width, mut text_height, mut text_rgba) =
             rasterize_wrapped_text_lines(&self.font_state, &full_lines, visible_chars);
+        if self.text_state.show_wait_mark && visible_chars == full_char_count {
+            if let Some(manager) = resource_manager.as_mut() {
+                self.ensure_wait_mark_sheet(manager);
+            }
+            let (mark_x, mark_y) =
+                text_end_cursor(&self.font_state, &full_lines, visible_chars).unwrap_or((0, 0));
+            let frame = self.pal_time_ms / 180;
+            let color = argb_to_rgba_bytes(self.text_state.text_color);
+            let (mark_w, mark_h, mark_rgba) = self
+                .text_state
+                .wait_mark_sheet
+                .as_ref()
+                .map(|sheet| wait_mark_frame(sheet, frame, color))
+                .unwrap_or_else(|| fallback_wait_mark(color));
+            blit_rgba_expand(
+                &mut text_rgba,
+                &mut text_width,
+                &mut text_height,
+                &mark_rgba,
+                mark_w,
+                mark_h,
+                mark_x,
+                mark_y.saturating_add(4),
+            );
+        }
         let base_image =
             self.load_text_base_image(assets, nls, resource_manager, self.text_state.base);
         let base_width = base_image.as_ref().map(|image| image.width).unwrap_or(0);
@@ -1829,6 +1870,41 @@ impl ScriptRuntime {
             audio,
         );
         log::debug!("[trace-audio] text_voice name={name:?} outcome={outcome:?}");
+    }
+
+    fn ensure_wait_mark_sheet(&mut self, resource_manager: &mut ResourceManager) {
+        if self.text_state.wait_mark_sheet.is_some() || self.text_state.wait_mark_missing {
+            return;
+        }
+        let name = self
+            .system_ini
+            .as_ref()
+            .and_then(|ini| ini_first_str(ini, "ex_fontname"))
+            .unwrap_or_else(|| "font_ex".to_owned());
+        match open_resource_variant(resource_manager, &name, FONT_SHEET_EXTENSIONS) {
+            Ok(asset) => match decode_image(&asset.bytes) {
+                Ok(image) => {
+                    log::debug!(
+                        "[trace-text] wait mark sheet {:?} {}x{}",
+                        asset.name,
+                        image.width,
+                        image.height
+                    );
+                    self.text_state.wait_mark_sheet = Some(image);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[trace-text] wait mark sheet {:?} decode failed: {err}",
+                        asset.name
+                    );
+                    self.text_state.wait_mark_missing = true;
+                }
+            },
+            Err(err) => {
+                log::debug!("[trace-text] wait mark sheet {name:?} open failed: {err}");
+                self.text_state.wait_mark_missing = true;
+            }
+        }
     }
 
     fn load_text_base_image(
@@ -3542,6 +3618,8 @@ impl ScriptRuntime {
                 log::debug!("[trace-script] wait_click duration_ms={duration_ms}");
                 if duration_ms == -1 {
                     if self.text_state.visible && self.text_state.last_text_value != 0 {
+                        self.text_state.show_wait_mark = true;
+                        self.text_state.dirty = true;
                         ExtCallOutcome::Wait {
                             value: 1,
                             request: WaitRequest::Click,
@@ -3550,6 +3628,7 @@ impl ScriptRuntime {
                         ExtCallOutcome::Value(1)
                     }
                 } else {
+                    self.text_state.show_wait_mark = false;
                     ExtCallOutcome::Wait {
                         value: 1,
                         request: WaitRequest::ClickOrTime(duration_ms.max(1) as u32),
@@ -3622,6 +3701,7 @@ impl ScriptRuntime {
                 let args = self.pop_ext_args(1);
                 let duration_ms = args.first().copied().unwrap_or(1);
                 log::debug!("[trace-script] wait_click_no_anim duration_ms={duration_ms}");
+                self.text_state.show_wait_mark = false;
                 if duration_ms == -1 {
                     // sub_444C90 shares the -1 text-task completion shortcut
                     // with wait_click, only bypassing wait-icon animation.
@@ -4092,6 +4172,7 @@ impl ScriptRuntime {
                 self.text_state.reveal_duration_ms =
                     self.text_reveal_duration_ms(ordered[1], ordered[0], assets, nls);
                 self.text_state.reveal_enabled = self.text_state.reveal_duration_ms > 0;
+                self.text_state.show_wait_mark = false;
                 self.text_state.visible = true;
                 self.text_state.dirty = true;
                 self.push_history_text_record(ordered);
@@ -4239,6 +4320,7 @@ impl ScriptRuntime {
                     self.text_reveal_duration_ms(ordered[1], ordered[0], assets, nls)
                 };
                 self.text_state.reveal_enabled = self.text_state.reveal_duration_ms > 0;
+                self.text_state.show_wait_mark = false;
                 self.text_state.visible = true;
                 self.text_state.dirty = true;
                 self.push_history_text_record(ordered);
@@ -12352,6 +12434,7 @@ fn is_dynamic_string_handle(value: i32) -> bool {
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &["", ".PGD", ".pgd"];
+const FONT_SHEET_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
 const MASK_IMAGE_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
 const ANIMATION_EXTENSIONS: &[&str] = &["", ".ANI", ".ani"];
 const AUDIO_EXTENSIONS: &[&str] = &["", ".OGG", ".ogg", ".WAV", ".wav"];
@@ -13211,6 +13294,149 @@ fn alpha_blend_rgba(dst: &mut [u8], src: &[u8]) {
     dst[3] = out_a.min(255) as u8;
 }
 
+fn ini_first_int(ini: &IniFile, key: &str) -> Option<i64> {
+    let key = key.to_ascii_lowercase();
+    ini.values()
+        .find_map(|section| section.get(&key).and_then(|value| value.as_int()))
+}
+
+fn ini_first_str(ini: &IniFile, key: &str) -> Option<String> {
+    let key = key.to_ascii_lowercase();
+    ini.values().find_map(|section| {
+        section
+            .get(&key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn argb_to_rgba_bytes(color: u32) -> [u8; 4] {
+    [
+        ((color >> 16) & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        (color & 0xFF) as u8,
+        ((color >> 24) & 0xFF) as u8,
+    ]
+}
+
+fn text_end_cursor(
+    font: &PalFontSystem,
+    lines: &[String],
+    visible_chars: usize,
+) -> Option<(u32, u32)> {
+    let line_gap = (u32::from(font.font_size()).max(12) / 4).max(4);
+    let mut y = 0u32;
+    let mut remaining = visible_chars;
+    let mut end = None;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            y = y.saturating_add(line_gap);
+        }
+        let line_chars = line.chars().count();
+        let take = remaining.min(line_chars);
+        remaining = remaining.saturating_sub(take);
+        if take > 0 {
+            let visible: String = line.chars().take(take).collect();
+            let (width, _) = font.measure(&visible);
+            end = Some((width, y));
+        }
+        let (_, layout_height) = font.measure(line);
+        y = y.saturating_add(layout_height.max(1));
+        if remaining == 0 {
+            break;
+        }
+    }
+    end
+}
+
+fn wait_mark_frame(sheet: &DecodedImage, frame: u32, color: [u8; 4]) -> (u32, u32, Vec<u8>) {
+    let cell_h = sheet.height.max(1);
+    let frames = if cell_h > 0 && sheet.width.is_multiple_of(cell_h) {
+        (sheet.width / cell_h).max(1)
+    } else {
+        1
+    };
+    let cell_w = (sheet.width / frames).max(1);
+    let frame = frame % frames;
+    let mut rgba = vec![0u8; cell_w as usize * cell_h as usize * 4];
+    for y in 0..cell_h.min(sheet.height) {
+        for x in 0..cell_w {
+            let sx = frame * cell_w + x;
+            if sx >= sheet.width {
+                continue;
+            }
+            let src_index = (y as usize * sheet.width as usize + sx as usize) * 4;
+            let Some(src) = sheet.rgba.get(src_index..src_index + 4) else {
+                continue;
+            };
+            let coverage = src[0].max(src[1]).max(src[2]);
+            if coverage == 0 {
+                continue;
+            }
+            let dst_index = (y as usize * cell_w as usize + x as usize) * 4;
+            rgba[dst_index] = color[0];
+            rgba[dst_index + 1] = color[1];
+            rgba[dst_index + 2] = color[2];
+            rgba[dst_index + 3] = ((u16::from(coverage) * u16::from(color[3])) / 255) as u8;
+        }
+    }
+    (cell_w, cell_h, rgba)
+}
+
+fn fallback_wait_mark(color: [u8; 4]) -> (u32, u32, Vec<u8>) {
+    let size = 14u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        let half = y / 2;
+        for x in (size / 2 - half)..(size / 2 + half) {
+            let index = (y as usize * size as usize + x as usize) * 4;
+            rgba[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    (size, size, rgba)
+}
+
+fn blit_rgba_expand(
+    dst: &mut Vec<u8>,
+    dst_width: &mut u32,
+    dst_height: &mut u32,
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_x: u32,
+    dst_y: u32,
+) {
+    let need_w = dst_x.saturating_add(src_width).max(*dst_width).max(1);
+    let need_h = dst_y.saturating_add(src_height).max(*dst_height).max(1);
+    if need_w != *dst_width || need_h != *dst_height {
+        let mut grown = vec![0u8; need_w as usize * need_h as usize * 4];
+        blit_rgba(
+            &mut grown,
+            need_w,
+            need_h,
+            dst,
+            *dst_width,
+            *dst_height,
+            0,
+            0,
+        );
+        *dst = grown;
+        *dst_width = need_w;
+        *dst_height = need_h;
+    }
+    blit_rgba(
+        dst,
+        *dst_width,
+        *dst_height,
+        src,
+        src_width,
+        src_height,
+        dst_x,
+        dst_y,
+    );
+}
+
 fn blit_rgba(
     dst: &mut [u8],
     dst_width: u32,
@@ -13705,6 +13931,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_mark_frame_uses_grayscale_as_coverage() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        rgba[0] = 255;
+        rgba[3] = 255;
+        let sheet = DecodedImage {
+            width: 4,
+            height: 2,
+            cell_width: 2,
+            cell_height: 2,
+            offset_x: 0,
+            offset_y: 0,
+            rgba,
+        };
+        let (w, h, glyph) = wait_mark_frame(&sheet, 0, [10, 20, 30, 255]);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&glyph[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&glyph[4..8], &[0, 0, 0, 0]);
+    }
+
     fn file_table_decode_falls_back_when_configured_nls_rejects_comments() {
         let bytes = b"// invalid comment byte for some NLS: \x80\n\"vo01\",\"vo01_test\",1\n";
         let table = parse_file_table(bytes, Nls::Gbk).expect("ASCII CSV rows should parse");

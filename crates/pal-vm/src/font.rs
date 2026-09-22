@@ -102,13 +102,20 @@ impl PalFontSystem {
 
     pub fn rasterize(&self, text: &str) -> (u32, u32, Vec<u8>) {
         let color = argb_to_bgra(self.color);
-        let (width, height, mut bgra) =
+        let (width, height, mut pixels) =
             self.fallback
                 .rasterize_line(text, f32::from(self.font_size.max(1)), color);
-        for px in bgra.chunks_exact_mut(4) {
+        for px in pixels.chunks_exact_mut(4) {
             px.swap(0, 2);
         }
-        (width, height, bgra)
+        if self.effect == 0 || text.is_empty() {
+            return (width, height, pixels);
+        }
+        let edge = argb_to_rgba(self.effect_color);
+        if edge[3] == 0 {
+            return (width, height, pixels);
+        }
+        apply_text_edge(&pixels, width, height, edge)
     }
 }
 
@@ -218,6 +225,57 @@ fn argb_to_bgra(color: u32) -> [u8; 4] {
     ]
 }
 
+fn argb_to_rgba(color: u32) -> [u8; 4] {
+    [
+        ((color >> 16) & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        (color & 0xFF) as u8,
+        ((color >> 24) & 0xFF) as u8,
+    ]
+}
+
+fn apply_text_edge(src: &[u8], width: u32, height: u32, edge: [u8; 4]) -> (u32, u32, Vec<u8>) {
+    let pad = 1u32;
+    let out_w = width.saturating_add(pad * 2).max(1);
+    let out_h = height.saturating_add(pad * 2).max(1);
+    let mut dst = vec![0u8; out_w as usize * out_h as usize * 4];
+    let stamp = |dst: &mut [u8], x: i32, y: i32, px: &[u8]| {
+        if x < 0 || y < 0 || x >= out_w as i32 || y >= out_h as i32 || px.len() < 4 || px[3] == 0 {
+            return;
+        }
+        let index = (y as usize * out_w as usize + x as usize) * 4;
+        dst[index..index + 4].copy_from_slice(&px[..4]);
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let src_index = (y as usize * width as usize + x as usize) * 4;
+            if src.get(src_index + 3).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let ox = x as i32 + pad as i32;
+            let oy = y as i32 + pad as i32;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    stamp(&mut dst, ox + dx, oy + dy, &edge);
+                }
+            }
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let src_index = (y as usize * width as usize + x as usize) * 4;
+            let Some(px) = src.get(src_index..src_index + 4) else {
+                continue;
+            };
+            stamp(&mut dst, x as i32 + pad as i32, y as i32 + pad as i32, px);
+        }
+    }
+    (out_w, out_h, dst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +295,20 @@ mod tests {
         assert_eq!(pixels.len(), w as usize * h as usize * 4);
         assert!(w > 0);
         assert!(h > 0);
+    }
+
+    #[test]
+    fn effect_adds_edge_pixels_around_the_glyph() {
+        let mut font = PalFontSystem::new();
+        font.set_font_size(28);
+        font.set_color(0xFFFF_0000, 0xFF00_0000);
+        font.set_effect(0);
+        let (_, _, plain) = font.rasterize("A");
+        font.set_effect(1);
+        let (_, _, edged) = font.rasterize("A");
+        let ink = |pixels: &[u8]| pixels.chunks_exact(4).filter(|px| px[3] > 0).count();
+        assert!(ink(&edged) > ink(&plain));
+        assert!(edged.chunks_exact(4).any(|px| px[0] == 255 && px[3] > 0));
     }
 
     #[test]
