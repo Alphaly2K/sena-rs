@@ -3628,7 +3628,11 @@ impl ScriptRuntime {
                 }
                 ExtCallOutcome::Wait {
                     value: 1,
-                    request: WaitRequest::Time(duration_ms as u32),
+                    request: if skip_cancel != 0 {
+                        WaitRequest::ClickOrTime(duration_ms as u32)
+                    } else {
+                        WaitRequest::Time(duration_ms as u32)
+                    },
                 }
             }
             // wait_click(duration_ms): Game.exe sub_444DE0 uses -1 as the

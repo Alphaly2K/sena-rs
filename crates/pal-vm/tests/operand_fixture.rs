@@ -345,6 +345,26 @@ fn wait_click_zero_duration_is_one_ms_click_or_time() {
 }
 
 #[test]
+fn cancellable_wait_accepts_input_before_timeout() {
+    let entry_pc = 12u32;
+    let mut body = Vec::new();
+    body.extend_from_slice(&opcode(31));
+    body.extend_from_slice(&word(imm(1)));
+    body.extend_from_slice(&opcode(31));
+    body.extend_from_slice(&word(imm(4000)));
+    body.extend_from_slice(&opcode(23));
+    body.extend_from_slice(&word(ext_raw(7, 0)));
+    body.extend_from_slice(&word(dst_slot(0)));
+    body.extend_from_slice(&opcode(21));
+
+    let assets = assets_with_script(entry_pc, body);
+    let config = ScriptRuntimeConfig::default();
+    let mut runtime = ScriptRuntime::boot(entry_pc, config.clone());
+    let tick = runtime.run_frame(&assets, &config).unwrap();
+    assert_eq!(tick.wait_request, Some(pal_vm::WaitRequest::ClickOrTime(4000)));
+}
+
+#[test]
 fn wait_click_no_anim_zero_duration_is_one_ms_click_or_time() {
     let entry_pc = 12u32;
     let mut body = Vec::new();
