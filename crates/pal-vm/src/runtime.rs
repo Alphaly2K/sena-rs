@@ -20,6 +20,12 @@ use crate::font::PalFontSystem;
 use crate::image::{decode_image, decode_image_with_resolver, DecodedImage};
 use crate::input::{PalInputState, PalMouseButton};
 use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
+use crate::save_format::{
+    composite_thumbnail, decode_original_save, encode_original_save, mosaic_rgba,
+    original_save_filename, original_save_path, patch_lock_dword, read_lock_dword,
+    OriginalSavePrefix, ThumbnailSprite, DEFAULT_THUMB_HEIGHT, DEFAULT_THUMB_WIDTH,
+    LOAD_THUMBNAIL_CAPTURE_SENTINEL, MOSAIC_FACTOR,
+};
 use crate::scene::{FrameScene, SceneTextureId, SolidQuad};
 use crate::sprite::{
     PalAnimationFlags, PalColor, PalRect, PalRenderMode, PalVec3, SpriteDesc, SpriteHandle,
@@ -332,6 +338,8 @@ pub struct ScriptRuntime {
     pending_msp_wait_slot: Option<i32>,
     /// Game button entries keyed by (button group, entry index).
     game_buttons: BTreeMap<(i32, i32), GameButtonEntry>,
+    /// Button state suppressed while a modal menu covers the title.
+    title_modal_buttons: Option<BTreeMap<(i32, i32), (bool, bool, u8)>>,
     /// Native `btn_init` group records: normal/hover resource ids plus the
     /// current onmouse index returned by category 8 index 23.
     button_groups: BTreeMap<i32, GameButtonGroup>,
@@ -751,13 +759,18 @@ struct SelectOption {
 #[derive(Clone, Debug, Default)]
 struct SaveSubsystemState {
     title: i32,
+    title_bytes: Vec<u8>,
     thumbnail_size: [i32; 2],
+    thumbnail_pixels: Vec<u8>,
+    mosaic_enabled: bool,
+    capture_from_screen: bool,
     text_rect: [i32; 4],
     font_size: i32,
     font_type: i32,
     font_effect: i32,
     font_color: i32,
     locked: bool,
+    locks: BTreeMap<i32, i32>,
     last_slot: i32,
     last_result: i32,
     snapshots: BTreeMap<i32, RuntimeSaveSnapshot>,
@@ -996,6 +1009,7 @@ impl ScriptRuntime {
             game_msprites: BTreeMap::new(),
             pending_msp_wait_slot: None,
             game_buttons: BTreeMap::new(),
+            title_modal_buttons: None,
             button_groups: BTreeMap::new(),
             button_push_queue: BTreeMap::new(),
             system_buttons: BTreeMap::new(),
@@ -1241,6 +1255,10 @@ impl ScriptRuntime {
     pub fn effect_overlay(&self, logical_width: u32, logical_height: u32) -> Option<SolidQuad> {
         self.effect_system
             .overlay_quad(logical_width, logical_height, self.pal_time_ms)
+    }
+
+    pub fn effect_state(&self) -> Option<crate::effect::PalEffectState> {
+        self.effect_system.state()
     }
 
     pub fn advance_msprites(&mut self, sprites: &mut SpriteSystem, delta_ms: u32) {
@@ -3136,11 +3154,7 @@ impl ScriptRuntime {
     /// direct bank; the original operand keeps its variable slot.
     fn mem_dat_indirect_word_index(&self, operand: Operand) -> Result<usize, RuntimeError> {
         let pointer_index = self.mem_dat_header_index(operand.bank as i32)?;
-        let loaded = self
-            .mem_dat_words
-            .get(pointer_index)
-            .copied()
-            .unwrap_or(0) as u32;
+        let loaded = self.mem_dat_words.get(pointer_index).copied().unwrap_or(0) as u32;
         let inner_bank = ((loaded >> 16) & 0x0FFF) as i32;
         self.mem_dat_word_index_parts(inner_bank, operand.lo)
     }
@@ -3454,47 +3468,69 @@ impl ScriptRuntime {
                 "enable_window_change" => return self.dispatch_font_system_stub(46),
                 "is_enable_window_change" => return self.dispatch_font_system_stub(47),
                 "history_skip" => return self.dispatch_font_system_stub(57),
-                "save" => return self.dispatch_save_stub(0, resource_manager, sprites),
-                "load" => return self.dispatch_save_stub(1, resource_manager, sprites),
-                "save_set_title" => return self.dispatch_save_stub(2, resource_manager, sprites),
-                "save_data" => return self.dispatch_save_stub(3, resource_manager, sprites),
+                "save" => {
+                    return self.dispatch_save_stub(0, assets, nls, resource_manager, sprites)
+                }
+                "load" => {
+                    return self.dispatch_save_stub(1, assets, nls, resource_manager, sprites)
+                }
+                "save_set_title" => {
+                    return self.dispatch_save_stub(2, assets, nls, resource_manager, sprites);
+                }
+                "save_data" => {
+                    return self.dispatch_save_stub(3, assets, nls, resource_manager, sprites);
+                }
                 "save_set_thumbnail_size" => {
-                    return self.dispatch_save_stub(4, resource_manager, sprites);
+                    return self.dispatch_save_stub(4, assets, nls, resource_manager, sprites);
                 }
                 "save_set_font_size" => {
-                    return self.dispatch_save_stub(7, resource_manager, sprites);
+                    return self.dispatch_save_stub(7, assets, nls, resource_manager, sprites);
                 }
-                "is_save" => return self.dispatch_save_stub(9, resource_manager, sprites),
-                "savepoint" => return self.dispatch_save_stub(11, resource_manager, sprites),
-                "savetimedraw" => return self.dispatch_save_stub(13, resource_manager, sprites),
+                "is_save" => {
+                    return self.dispatch_save_stub(9, assets, nls, resource_manager, sprites);
+                }
+                "savepoint" => {
+                    return self.dispatch_save_stub(11, assets, nls, resource_manager, sprites);
+                }
+                "savetimedraw" => {
+                    return self.dispatch_save_stub(13, assets, nls, resource_manager, sprites);
+                }
                 "save_set_text_rect" => {
-                    return self.dispatch_save_stub(15, resource_manager, sprites);
+                    return self.dispatch_save_stub(15, assets, nls, resource_manager, sprites);
                 }
                 "get_new_savefile" => {
-                    return self.dispatch_save_stub(17, resource_manager, sprites);
+                    return self.dispatch_save_stub(17, assets, nls, resource_manager, sprites);
                 }
                 "save_set_font_type" => {
-                    return self.dispatch_save_stub(23, resource_manager, sprites);
+                    return self.dispatch_save_stub(23, assets, nls, resource_manager, sprites);
                 }
                 "set_load_after_process" => {
-                    return self.dispatch_save_stub(24, resource_manager, sprites);
+                    return self.dispatch_save_stub(24, assets, nls, resource_manager, sprites);
                 }
-                "savesystemdata" => return self.dispatch_save_stub(25, resource_manager, sprites),
+                "savesystemdata" => {
+                    return self.dispatch_save_stub(25, assets, nls, resource_manager, sprites);
+                }
                 "save_set_font_effect" => {
-                    return self.dispatch_save_stub(26, resource_manager, sprites);
+                    return self.dispatch_save_stub(26, assets, nls, resource_manager, sprites);
                 }
                 "save_set_font_color_0x_0x" => {
-                    return self.dispatch_save_stub(27, resource_manager, sprites);
+                    return self.dispatch_save_stub(27, assets, nls, resource_manager, sprites);
                 }
                 "save_lock_not_open_savefileno" => {
-                    return self.dispatch_save_stub(32, resource_manager, sprites);
+                    return self.dispatch_save_stub(32, assets, nls, resource_manager, sprites);
                 }
-                "is_save_lock" => return self.dispatch_save_stub(33, resource_manager, sprites),
-                "is_prev_data" => return self.dispatch_save_stub(34, resource_manager, sprites),
+                "is_save_lock" => {
+                    return self.dispatch_save_stub(33, assets, nls, resource_manager, sprites);
+                }
+                "is_prev_data" => {
+                    return self.dispatch_save_stub(34, assets, nls, resource_manager, sprites);
+                }
                 "save_point_clear" => {
-                    return self.dispatch_save_stub(35, resource_manager, sprites);
+                    return self.dispatch_save_stub(35, assets, nls, resource_manager, sprites);
                 }
-                "save_point_lock" => return self.dispatch_save_stub(36, resource_manager, sprites),
+                "save_point_lock" => {
+                    return self.dispatch_save_stub(36, assets, nls, resource_manager, sprites);
+                }
                 "system_btn_set" => return self.dispatch_system_button_stub(0),
                 "system_btn_release" => return self.dispatch_system_button_stub(1),
                 "system_btn_enable" => return self.dispatch_system_button_stub(2),
@@ -3585,7 +3621,7 @@ impl ScriptRuntime {
             7 => self.dispatch_wait_ext(index),
             8 => self.dispatch_button_ext(index, assets, nls, resource_manager, sprites, input),
             9 => self.dispatch_font_system_stub(index),
-            10 => self.dispatch_save_stub(index, resource_manager, sprites),
+            10 => self.dispatch_save_stub(index, assets, nls, resource_manager, sprites),
             12 => self.dispatch_system_button_stub(index),
             14 => self.dispatch_history_stub(index),
             6 => self.dispatch_select_stub(index),
@@ -4717,7 +4753,7 @@ impl ScriptRuntime {
             17 => return self.ext_btn_get_push(input, sprites.as_deref()),
             18 => return self.ext_btn_expansion(sprites),
             19 => return self.ext_btn_lock(),
-            20 => return self.ext_btn_unlock(),
+            20 => return self.ext_btn_unlock(sprites),
             21 => return self.ext_btn_set_anim(assets, nls, resource_manager, sprites),
             22 => return self.ext_btn_set_hit(),
             23 => return self.ext_btn_get_onmouse(input, sprites.as_deref()),
@@ -4794,26 +4830,39 @@ impl ScriptRuntime {
 
     /// Game category 10 save/load extcalls.
     ///
-    /// These calls are Game.exe save-UI state operations plus portable
-    /// persistence for this runtime. They pop the script arity from shared
-    /// ExtSig/handler evidence, update `SaveSubsystemState`, serialize the VM
-    /// snapshot as `save/sena_rs/saveNNN.sav`, and return PAL-style integer
-    /// success/query values. Thumbnail capture is represented by the original
-    /// script metadata rather than native pixel data.
+    /// Files follow Koikake's `save/save%03d.dat` prefix: lock dword, title,
+    /// mosaic flag, and the thumbnail RGBA `thumbnail_set` reads at `0x224`.
+    /// A `SENARSAV` trailer keeps this runtime's VM snapshot so load can restore
+    /// script state. Native `save` pops `(slot, flag)` and still returns 1 when
+    /// the slot is out of range.
     fn dispatch_save_stub(
         &mut self,
         index: u16,
+        assets: &CoreAssets,
+        nls: Nls,
         mut resource_manager: Option<&mut ResourceManager>,
         sprites: Option<&mut SpriteSystem>,
     ) -> ExtCallOutcome {
         match index {
             0 => {
-                let args = self.pop_ext_args(1);
+                let args = self.pop_ext_args(2);
                 let slot = args.first().copied().unwrap_or(0);
+                let remember = args.get(1).copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
-                if self.save_state.locked {
-                    self.save_state.last_result = 0;
-                    return ExtCallOutcome::Value(0);
+                if !(0..1000).contains(&slot) {
+                    log::debug!("[trace-save] save rejected slot={slot}");
+                    self.save_state.last_result = 1;
+                    return ExtCallOutcome::Value(1);
+                }
+                if remember != 0 {
+                    self.save_state.last_slot = slot;
+                }
+                if let Some(sprites) = sprites.as_deref() {
+                    if self.save_state.capture_from_screen
+                        || self.save_state.thumbnail_pixels.is_empty()
+                    {
+                        self.capture_thumbnail(sprites);
+                    }
                 }
                 let snapshot = self.capture_save_snapshot();
                 self.save_state.snapshots.insert(slot, snapshot);
@@ -4821,24 +4870,37 @@ impl ScriptRuntime {
                     resource_manager.as_deref(),
                     self.save_state.snapshots.get(&slot),
                 ) {
-                    match write_runtime_save_snapshot(manager.root(), slot, snapshot) {
-                        Ok(path) => log::debug!(
-                            "[trace-save] save slot={slot} portable_file={}",
-                            path.display()
-                        ),
+                    match self.write_original_save(manager.root(), slot, snapshot) {
+                        Ok(path) => {
+                            log::debug!("[trace-save] save slot={slot} file={}", path.display())
+                        }
                         Err(err) => {
-                            log::warn!("[trace-save] save slot={slot} portable_file failed: {err}")
+                            log::warn!("[trace-save] save slot={slot} file failed: {err}")
                         }
                     }
                 }
                 self.save_state.last_result = 1;
-                log::debug!("[trace-save] save slot={slot} portable_snapshot=true");
+                log::debug!("[trace-save] save slot={slot} original_file=true");
                 ExtCallOutcome::Value(1)
             }
             1 => {
                 let args = self.pop_ext_args(1);
                 let slot = args.first().copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
+                if let Some(manager) = resource_manager.as_deref() {
+                    if let Ok(prefix) = read_original_save_prefix(manager.root(), slot) {
+                        self.save_state.locks.insert(slot, prefix.lock);
+                        self.save_state.mosaic_enabled = prefix.mosaic != 0;
+                        if prefix.thumb_width > 0 && prefix.thumb_height > 0 {
+                            self.save_state.thumbnail_size =
+                                [prefix.thumb_width, prefix.thumb_height];
+                            self.save_state.thumbnail_pixels = prefix.pixels;
+                        }
+                        if !prefix.title.is_empty() {
+                            self.save_state.title_bytes = prefix.title;
+                        }
+                    }
+                }
                 let snapshot = self.save_state.snapshots.get(&slot).cloned().or_else(|| {
                     resource_manager
                         .as_deref()
@@ -4847,25 +4909,53 @@ impl ScriptRuntime {
                 if let Some(snapshot) = snapshot {
                     self.restore_save_snapshot(snapshot);
                     self.save_state.last_result = 1;
-                    log::debug!("[trace-save] load slot={slot} portable_snapshot=true");
+                    log::debug!("[trace-save] load slot={slot} snapshot=true");
                     return ExtCallOutcome::Value(1);
                 }
-                self.save_state.last_result = 0;
-                log::debug!("[trace-save] load slot={slot} portable_snapshot=false");
+                let has_file = resource_manager
+                    .as_ref()
+                    .and_then(|manager| {
+                        find_loose_save_file(manager.root(), &original_save_filename(slot))
+                    })
+                    .is_some();
+                self.save_state.last_result = i32::from(has_file);
+                log::debug!("[trace-save] load slot={slot} file={has_file}");
                 ExtCallOutcome::Value(self.save_state.last_result)
             }
             2 => {
                 let args = self.pop_ext_args(1);
-                self.save_state.title = args.first().copied().unwrap_or(0);
+                let title = args.first().copied().unwrap_or(0);
+                self.save_state.title = title;
+                if let Some(text) = self.resolve_resource_string(title, assets, nls) {
+                    self.save_state.title_bytes = text.into_bytes();
+                }
+                log::debug!("[trace-save] save_set_title value={title}");
+                ExtCallOutcome::Value(1)
+            }
+            5 => self.ext_thumbnail_set(resource_manager, sprites),
+            12 => {
+                let args = self.pop_ext_args(1);
+                let enabled = args.first().copied().unwrap_or(0);
+                self.save_state.mosaic_enabled = enabled != 0;
+                log::debug!("[trace-save] save_thumbnail_mosaic_set enabled={enabled}");
+                ExtCallOutcome::Value(1)
+            }
+            22 => {
+                if let Some(sprites) = sprites {
+                    self.capture_thumbnail(sprites);
+                }
                 log::debug!(
-                    "[trace-save] save_set_title value={}",
-                    self.save_state.title
+                    "[trace-save] thumbnail_renew capture={} mosaic={}",
+                    self.save_state.capture_from_screen,
+                    self.save_state.mosaic_enabled
                 );
                 ExtCallOutcome::Value(1)
             }
-            3 | 5 | 6 | 12 | 14 | 16 | 21 | 22 | 28 | 29 | 30 | 31 | 35 => {
+            30 => self.ext_copy_save_file(resource_manager),
+            31 => self.ext_load_thumbnail(assets, nls, resource_manager, sprites),
+            3 | 6 | 14 | 16 | 21 | 28 | 29 | 35 => {
                 self.pop_ext_args(match index {
-                    3 | 5 | 6 | 12 | 13 | 14 | 16 | 21 | 22 | 28 | 29 | 30 | 31 => 1,
+                    3 | 6 | 14 | 16 | 21 | 28 | 29 => 1,
                     _ => 0,
                 });
                 ExtCallOutcome::Value(1)
@@ -4925,12 +5015,13 @@ impl ScriptRuntime {
                 ];
                 ExtCallOutcome::Value(1)
             }
-            11 | 32 => {
+            11 => {
                 let args = self.pop_ext_args(1);
                 self.save_state.last_slot = args.first().copied().unwrap_or(0);
                 self.save_state.last_result = if self.save_state.locked { 0 } else { 1 };
                 ExtCallOutcome::Value(self.save_state.last_result)
             }
+            32 => self.ext_save_lock(resource_manager),
             23 => {
                 let args = self.pop_ext_args(1);
                 self.save_state.font_type = args.first().copied().unwrap_or(0);
@@ -4961,10 +5052,7 @@ impl ScriptRuntime {
                 self.save_state.font_color = args.first().copied().unwrap_or(0);
                 ExtCallOutcome::Value(1)
             }
-            33 => {
-                self.pop_ext_args(0);
-                ExtCallOutcome::Value(i32::from(self.save_state.locked))
-            }
+            33 => self.ext_is_save_lock(resource_manager),
             34 => {
                 self.pop_ext_args(0);
                 ExtCallOutcome::Value(i32::from(self.save_state.last_result != 0))
@@ -4976,6 +5064,305 @@ impl ScriptRuntime {
             }
             _ => ExtCallOutcome::Skip,
         }
+    }
+
+    fn thumbnail_size_or_default(&self) -> (i32, i32) {
+        let width = if self.save_state.thumbnail_size[0] > 0 {
+            self.save_state.thumbnail_size[0]
+        } else {
+            DEFAULT_THUMB_WIDTH
+        };
+        let height = if self.save_state.thumbnail_size[1] > 0 {
+            self.save_state.thumbnail_size[1]
+        } else {
+            DEFAULT_THUMB_HEIGHT
+        };
+        (width, height)
+    }
+
+    fn capture_thumbnail(&mut self, sprites: &SpriteSystem) {
+        let (width, height) = self.thumbnail_size_or_default();
+        let (logical_width, logical_height) = self.logical_size();
+        let samples = self.thumbnail_sprite_samples(sprites);
+        let factor = self.save_state.mosaic_enabled.then_some(MOSAIC_FACTOR);
+        self.save_state.thumbnail_pixels = composite_thumbnail(
+            &samples,
+            logical_width,
+            logical_height,
+            width as u32,
+            height as u32,
+            factor,
+        );
+        self.save_state.thumbnail_size = [width, height];
+    }
+
+    fn thumbnail_sprite_samples(&self, sprites: &SpriteSystem) -> Vec<ThumbnailSprite> {
+        let mut samples = Vec::new();
+        for handle in self.game_sprites.values().copied() {
+            let Some(sprite) = sprites.get(handle) else {
+                continue;
+            };
+            if !sprite.visible {
+                continue;
+            }
+            let Some(surface) = sprites.surface(sprite.surface) else {
+                continue;
+            };
+            let texture = surface.to_scene_texture();
+            let width = texture.width.max(1);
+            let height = texture.height.max(1);
+            let expected = width as usize * height as usize * 4;
+            if texture.pixels.len() < expected {
+                continue;
+            }
+            samples.push(ThumbnailSprite {
+                x: sprite.position.x as i32,
+                y: sprite.position.y as i32,
+                width,
+                height,
+                rgba: texture.pixels[..expected].to_vec(),
+            });
+        }
+        samples
+    }
+
+    fn current_save_prefix(&self, slot: i32) -> OriginalSavePrefix {
+        let (width, height) = self.thumbnail_size_or_default();
+        let mut pixels = self.save_state.thumbnail_pixels.clone();
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            pixels.resize(expected, 0);
+        }
+        if self.save_state.mosaic_enabled {
+            pixels = mosaic_rgba(&pixels, width as u32, height as u32, MOSAIC_FACTOR);
+        }
+        OriginalSavePrefix {
+            lock: self.save_state.locks.get(&slot).copied().unwrap_or(0),
+            title: self.save_state.title_bytes.clone(),
+            mosaic: i32::from(self.save_state.mosaic_enabled),
+            thumb_width: width,
+            thumb_height: height,
+            pixels,
+        }
+    }
+
+    fn write_original_save(
+        &self,
+        root: &Path,
+        slot: i32,
+        snapshot: &RuntimeSaveSnapshot,
+    ) -> std::io::Result<PathBuf> {
+        let prefix = self.current_save_prefix(slot);
+        let snapshot_bytes = encode_runtime_save_snapshot(snapshot)?;
+        let bytes = encode_original_save(&prefix, &snapshot_bytes);
+        let path = original_save_path(root, slot);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// `thumbnail_set` pops `(slot, save_slot, x, y)` and blits the stored
+    /// thumbnail RGBA onto that sprite. Missing files still return 1.
+    fn ext_thumbnail_set(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(4);
+        if args.len() < 4 {
+            return ExtCallOutcome::Block;
+        }
+        let slot = args[0];
+        let save_slot = args[1];
+        let x = args[2];
+        let y = args[3];
+        let prefix = resource_manager
+            .as_deref()
+            .and_then(|manager| read_original_save_prefix(manager.root(), save_slot).ok())
+            .or_else(|| {
+                (self.save_state.last_slot == save_slot
+                    && !self.save_state.thumbnail_pixels.is_empty())
+                .then(|| self.current_save_prefix(save_slot))
+            });
+        let Some(prefix) = prefix else {
+            log::debug!("[trace-save] thumbnail_set slot={slot} save_slot={save_slot} missing");
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(sprites) = sprites else {
+            return ExtCallOutcome::Value(1);
+        };
+        if let Some(old) = self.game_sprites.remove(&slot) {
+            sprites.release(old);
+        }
+        let width = prefix.thumb_width.max(1) as u32;
+        let height = prefix.thumb_height.max(1) as u32;
+        let mut pixels = prefix.pixels;
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            pixels.resize(expected, 0);
+        }
+        let Some(handle) = sprites.create_rgba_sprite(
+            width,
+            height,
+            pixels,
+            PalVec3::from_f32(x as f32, y as f32, 0.0),
+            game_sprite_priority(slot),
+            format!("thumbnail:{save_slot}"),
+        ) else {
+            return ExtCallOutcome::Value(0);
+        };
+        self.game_sprites.insert(slot, handle);
+        log::debug!(
+            "[trace-save] thumbnail_set slot={slot} save_slot={save_slot} pos=({x},{y}) size={width}x{height}"
+        );
+        ExtCallOutcome::Value(1)
+    }
+
+    fn ext_copy_save_file(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let dest = args[0];
+        let src = args[1];
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(0);
+        };
+        let src_path = find_loose_save_file(manager.root(), &original_save_filename(src))
+            .unwrap_or_else(|| original_save_path(manager.root(), src));
+        let dest_path = original_save_path(manager.root(), dest);
+        let copied = if src_path.is_file() {
+            if let Some(parent) = dest_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::copy(&src_path, &dest_path).is_ok()
+        } else {
+            false
+        };
+        if copied {
+            if let Some(snapshot) = self.save_state.snapshots.get(&src).cloned() {
+                self.save_state.snapshots.insert(dest, snapshot);
+            }
+            if let Some(lock) = self.save_state.locks.get(&src).copied() {
+                self.save_state.locks.insert(dest, lock);
+            }
+        }
+        log::debug!("[trace-save] copy_file dest={dest} src={src} copied={copied}");
+        ExtCallOutcome::Value(i32::from(copied))
+    }
+
+    fn ext_load_thumbnail(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        resource_manager: Option<&mut ResourceManager>,
+        _sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(1);
+        let value = args.first().copied().unwrap_or(0);
+        if value == LOAD_THUMBNAIL_CAPTURE_SENTINEL {
+            self.save_state.capture_from_screen = true;
+            log::debug!("[trace-save] load_thumbnail capture enabled");
+            return ExtCallOutcome::Value(1);
+        }
+        self.save_state.capture_from_screen = false;
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(name) = self.resolve_resource_string(value, assets, nls) else {
+            return ExtCallOutcome::Value(1);
+        };
+        let asset = match open_resource_variant(manager, &name, IMAGE_EXTENSIONS) {
+            Ok(asset) => asset,
+            Err(err) => {
+                log::warn!("[trace-save] load_thumbnail name={name:?} open failed: {err}");
+                return ExtCallOutcome::Value(1);
+            }
+        };
+        let decoded = match decode_asset_image(manager, &asset) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("[trace-save] load_thumbnail name={name:?} decode failed: {err}");
+                return ExtCallOutcome::Value(1);
+            }
+        };
+        let (width, height) = self.thumbnail_size_or_default();
+        self.save_state.thumbnail_pixels = composite_thumbnail(
+            &[ThumbnailSprite {
+                x: 0,
+                y: 0,
+                width: decoded.width,
+                height: decoded.height,
+                rgba: decoded.rgba,
+            }],
+            decoded.width.max(1),
+            decoded.height.max(1),
+            width as u32,
+            height as u32,
+            self.save_state.mosaic_enabled.then_some(MOSAIC_FACTOR),
+        );
+        self.save_state.thumbnail_size = [width, height];
+        log::debug!("[trace-save] load_thumbnail name={name:?} size={width}x{height}");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `save_lock` pops `(slot, value)` and writes that dword at offset 0.
+    /// A missing file still returns 1, matching the native open-error path.
+    fn ext_save_lock(&mut self, resource_manager: Option<&mut ResourceManager>) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let slot = args[0];
+        let value = args[1];
+        self.save_state.locks.insert(slot, value);
+        self.save_state.last_slot = slot;
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(1);
+        };
+        let path = find_loose_save_file(manager.root(), &original_save_filename(slot))
+            .unwrap_or_else(|| original_save_path(manager.root(), slot));
+        if !path.is_file() {
+            log::debug!("[trace-save] save_lock slot={slot} missing");
+            return ExtCallOutcome::Value(1);
+        }
+        match std::fs::read(&path) {
+            Ok(mut bytes) => {
+                if patch_lock_dword(&mut bytes, value) {
+                    if let Err(err) = std::fs::write(&path, bytes) {
+                        log::warn!("[trace-save] save_lock slot={slot} write failed: {err}");
+                    }
+                }
+            }
+            Err(err) => log::warn!("[trace-save] save_lock slot={slot} read failed: {err}"),
+        }
+        log::debug!("[trace-save] save_lock slot={slot} value={value}");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `is_save_lock` pops a slot and returns the file's first dword.
+    fn ext_is_save_lock(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(1);
+        let slot = args.first().copied().unwrap_or(0);
+        self.save_state.last_slot = slot;
+        let from_file = resource_manager.as_ref().and_then(|manager| {
+            let path = find_loose_save_file(manager.root(), &original_save_filename(slot))?;
+            let bytes = std::fs::read(path).ok()?;
+            Some(read_lock_dword(&bytes))
+        });
+        let value = from_file
+            .or_else(|| self.save_state.locks.get(&slot).copied())
+            .unwrap_or(0);
+        log::debug!("[trace-save] is_save_lock slot={slot} value={value}");
+        ExtCallOutcome::Value(value)
     }
 
     /// Game category 10 index 13 (`sub_431C70`, "AdvCommandSaveTimeDraw").
@@ -6649,6 +7036,9 @@ impl ScriptRuntime {
     fn ext_btn_uninit(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let group = args.first().copied().unwrap_or(-1);
+        if group < 0 || group == 1 {
+            self.title_modal_buttons = None;
+        }
         let keys: Vec<_> = self
             .game_buttons
             .keys()
@@ -7019,9 +7409,25 @@ impl ScriptRuntime {
     /// `btn_unlock(group)` matches Game.exe sub_40E040 and clears native
     /// group-level lock fields.  The compatibility runtime unlocks every entry
     /// in the group.
-    fn ext_btn_unlock(&mut self) -> ExtCallOutcome {
+    fn ext_btn_unlock(&mut self, mut sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let group = args.first().copied().unwrap_or(-1);
+        if group == 1 {
+            if let Some(saved) = self.title_modal_buttons.take() {
+                for (key, (visible, enabled, alpha)) in saved {
+                    let Some(entry) = self.game_buttons.get_mut(&key) else {
+                        continue;
+                    };
+                    entry.visible = visible;
+                    entry.enabled = enabled;
+                    entry.alpha = alpha;
+                    if let Some(sprites) = sprites.as_deref_mut() {
+                        sprites.view_ctrl(entry.handle, visible);
+                        sprites.set_alpha(entry.handle, alpha);
+                    }
+                }
+            }
+        }
         for entry in self.matching_button_entries_mut(group, -1) {
             entry.locked = false;
         }
@@ -11915,10 +12321,10 @@ impl ScriptRuntime {
 
     /// Game category 18 index 34 (`sub_416EC0`) pops handle, encoded string
     /// entry, then destination dynamic-string slot.  The second popped value is
-    /// masked with `0x7fffffff` and used as a string-table offset; the third is
-    /// masked with `0xefffffff` and selects the native 2047-byte dynamic
-    /// string buffer.  Keeping this order matters because the table-name helper
-    /// runs immediately before sprite transition calls and a swapped entry/dst
+    /// masked with `0x7fffffff` and used as a string-table offset; the third
+    /// names the destination dynamic string buffer. Keeping this order matters
+    /// because the table-name helper runs immediately before sprite transition
+    /// calls and a swapped entry/dst
     /// leaves resource names unresolved.
     fn ext_file_string(&mut self) -> ExtCallOutcome {
         let args = self.pop_ext_args(3);
@@ -11927,7 +12333,7 @@ impl ScriptRuntime {
         }
         let handle = args[0];
         let entry = args[1];
-        let dst_slot = args[2] & 0xEFFF_FFFFu32 as i32;
+        let dst_slot = args[2];
         let Some(file) = self.file_handle_mut(handle) else {
             return ExtCallOutcome::Value(0);
         };
@@ -12237,6 +12643,17 @@ impl ScriptRuntime {
         if group != 1 || !matches!(index, 3..=6) {
             return;
         }
+
+        if self.title_modal_buttons.is_some() {
+            return;
+        }
+        self.title_modal_buttons = Some(
+            self.game_buttons
+                .iter()
+                .filter(|((button_group, _), _)| *button_group == group)
+                .map(|(key, entry)| (*key, (entry.visible, entry.enabled, entry.alpha)))
+                .collect(),
+        );
 
         let keys = self
             .game_buttons
@@ -12975,15 +13392,7 @@ fn portable_system_data_path(root: &Path) -> PathBuf {
     portable_save_dir(root).join("system.ini")
 }
 
-fn write_runtime_save_snapshot(
-    root: &Path,
-    slot: i32,
-    snapshot: &RuntimeSaveSnapshot,
-) -> std::io::Result<PathBuf> {
-    let path = portable_save_path(root, slot);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"SENARSAV");
     write_u32(&mut bytes, 1)?;
@@ -13005,13 +13414,58 @@ fn write_runtime_save_snapshot(
     write_i32(&mut bytes, snapshot.text_base)?;
     write_i32(&mut bytes, snapshot.text_mode)?;
     bytes.write_all(&[u8::from(snapshot.text_visible)])?;
-    std::fs::write(&path, bytes)?;
+    Ok(bytes)
+}
+
+fn write_runtime_save_snapshot(
+    root: &Path,
+    slot: i32,
+    snapshot: &RuntimeSaveSnapshot,
+) -> std::io::Result<PathBuf> {
+    let path = original_save_path(root, slot);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (width, height) = (DEFAULT_THUMB_WIDTH, DEFAULT_THUMB_HEIGHT);
+    let prefix = OriginalSavePrefix::empty(width, height);
+    let snapshot_bytes = encode_runtime_save_snapshot(snapshot)?;
+    std::fs::write(&path, encode_original_save(&prefix, &snapshot_bytes))?;
     Ok(path)
 }
 
+fn read_original_save_prefix(root: &Path, slot: i32) -> std::io::Result<OriginalSavePrefix> {
+    let path = find_loose_save_file(root, &original_save_filename(slot))
+        .unwrap_or_else(|| original_save_path(root, slot));
+    let bytes = std::fs::read(path)?;
+    decode_original_save(&bytes)
+        .map(|(prefix, _)| prefix)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save"))
+}
+
 fn read_runtime_save_snapshot(root: &Path, slot: i32) -> std::io::Result<RuntimeSaveSnapshot> {
-    let bytes = std::fs::read(portable_save_path(root, slot))?;
-    let mut cursor = Cursor::new(bytes.as_slice());
+    let original = find_loose_save_file(root, &original_save_filename(slot))
+        .unwrap_or_else(|| original_save_path(root, slot));
+    if original.is_file() {
+        let bytes = std::fs::read(&original)?;
+        if let Some((_, Some(trailer))) = decode_original_save(&bytes) {
+            return decode_runtime_save_snapshot(trailer);
+        }
+        if bytes.starts_with(b"SENARSAV") {
+            return decode_runtime_save_snapshot(&bytes);
+        }
+    }
+    let legacy = portable_save_path(root, slot);
+    if legacy.is_file() {
+        return decode_runtime_save_snapshot(&std::fs::read(legacy)?);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "save snapshot not found",
+    ))
+}
+
+fn decode_runtime_save_snapshot(bytes: &[u8]) -> std::io::Result<RuntimeSaveSnapshot> {
+    let mut cursor = Cursor::new(bytes);
     let mut magic = [0_u8; 8];
     cursor.read_exact(&mut magic)?;
     if &magic != b"SENARSAV" {
