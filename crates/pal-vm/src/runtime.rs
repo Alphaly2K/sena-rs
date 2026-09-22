@@ -10,7 +10,10 @@ use pal_script::opcodes::{ext_opcode, primary_opcode};
 use pal_script::{Operand, OperandKind, PointTable, ScriptImage};
 
 use crate::assets::CoreAssets;
-use crate::audio::{AudioHandle, AudioSystem, PalSoundGroup, PalVolume};
+use crate::audio::{
+    audio_lookup_key, decode_game_audio, parse_bgm_csv, AudioHandle, AudioSystem, BgmLoop,
+    PalSoundGroup, PalVolume,
+};
 use crate::config::{ini_graphics_size, parse_ini_nls, IniFile, IniValue};
 use crate::effect::PalEffectSystem;
 use crate::font::PalFontSystem;
@@ -348,6 +351,8 @@ pub struct ScriptRuntime {
     bgm_muted: bool,
     bgm_auto_volume_percent: i32,
     bgm_auto_muted: bool,
+    /// `BGM.CSV` sample loop points, loaded once. `None` means not read yet.
+    bgm_loops: Option<BTreeMap<String, BgmLoop>>,
     se_volume_percent: BTreeMap<i32, i32>,
     se_enabled: BTreeMap<i32, bool>,
     se_muted: BTreeMap<i32, bool>,
@@ -1001,6 +1006,7 @@ impl ScriptRuntime {
             bgm_muted: false,
             bgm_auto_volume_percent: 100,
             bgm_auto_muted: false,
+            bgm_loops: None,
             se_volume_percent: BTreeMap::new(),
             se_enabled: BTreeMap::new(),
             se_muted: BTreeMap::new(),
@@ -1864,6 +1870,7 @@ impl ScriptRuntime {
             0,
             100,
             true,
+            None,
             assets,
             nls,
             resource_manager,
@@ -10658,7 +10665,7 @@ impl ScriptRuntime {
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(7);
@@ -10675,6 +10682,16 @@ impl ScriptRuntime {
         let name_value = args[1];
         let flags = args[2];
         let fade_time = args[3];
+        let script_start = args[4];
+        let script_end = args[5];
+        let loop_samples = self.bgm_loop_samples_for(
+            resource_manager.as_deref_mut(),
+            assets,
+            nls,
+            name_value,
+            script_start,
+            script_end,
+        );
         let outcome = self.audio_load_and_play(
             4,
             slot,
@@ -10683,6 +10700,7 @@ impl ScriptRuntime {
             flags,
             100,
             true,
+            loop_samples,
             assets,
             nls,
             resource_manager,
@@ -10698,7 +10716,7 @@ impl ScriptRuntime {
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(5);
@@ -10706,6 +10724,8 @@ impl ScriptRuntime {
             return ExtCallOutcome::Block;
         }
         let slot = if args[0] == -1 { 0 } else { args[0] };
+        let loop_samples =
+            self.bgm_loop_samples_for(resource_manager.as_deref_mut(), assets, nls, args[1], 0, 0);
         self.audio_load_and_play(
             4,
             slot,
@@ -10714,6 +10734,7 @@ impl ScriptRuntime {
             0x2000_0000u32 as i32,
             100,
             false,
+            loop_samples,
             assets,
             nls,
             resource_manager,
@@ -10817,6 +10838,54 @@ impl ScriptRuntime {
         }
     }
 
+    /// Script `start`/`end` override the CSV when `end > start`. Otherwise the
+    /// row in `BGM.CSV` supplies PCM sample loop points. Missing rows loop the
+    /// whole file when the play flag requests looping.
+    fn bgm_loop_samples_for(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        assets: &CoreAssets,
+        nls: Nls,
+        name_value: i32,
+        script_start: i32,
+        script_end: i32,
+    ) -> Option<(i64, i64)> {
+        if script_end > script_start {
+            return Some((i64::from(script_start), i64::from(script_end)));
+        }
+        let Some(name) = self.resolve_resource_string(name_value, assets, nls) else {
+            return Some((0, 0));
+        };
+        let Some(resource_manager) = resource_manager else {
+            return Some((0, 0));
+        };
+        self.ensure_bgm_loops(resource_manager);
+        let row = self
+            .bgm_loops
+            .as_ref()
+            .and_then(|table| table.get(&audio_lookup_key(&name)))
+            .copied();
+        Some(
+            row.map(|row| (row.loop_start_samples, row.loop_end_samples))
+                .unwrap_or((0, 0)),
+        )
+    }
+
+    fn ensure_bgm_loops(&mut self, resource_manager: &mut ResourceManager) {
+        if self.bgm_loops.is_some() {
+            return;
+        }
+        let table = match resource_manager.open("BGM.CSV") {
+            Ok(asset) => parse_bgm_csv(&asset.bytes),
+            Err(err) => {
+                log::debug!("[trace-audio] BGM.CSV unavailable: {err}");
+                BTreeMap::new()
+            }
+        };
+        log::debug!("[trace-audio] BGM.CSV rows={}", table.len());
+        self.bgm_loops = Some(table);
+    }
+
     fn apply_bgm_group_volume(&self, audio: Option<&mut AudioSystem>) {
         if let Some(audio) = audio {
             let volume = if self.bgm_muted {
@@ -10862,6 +10931,7 @@ impl ScriptRuntime {
             args[3],
             args[4],
             true,
+            None,
             assets,
             nls,
             resource_manager,
@@ -10900,6 +10970,7 @@ impl ScriptRuntime {
             args[2],
             100,
             true,
+            None,
             assets,
             nls,
             resource_manager,
@@ -11036,6 +11107,7 @@ impl ScriptRuntime {
         flags: i32,
         volume_percent: i32,
         play: bool,
+        loop_samples: Option<(i64, i64)>,
         assets: &CoreAssets,
         nls: Nls,
         resource_manager: Option<&mut ResourceManager>,
@@ -11066,7 +11138,21 @@ impl ScriptRuntime {
                 return ExtCallOutcome::Value(0);
             }
         };
-        let handle = match audio.load_static_asset(asset.clone(), group) {
+        let decoded = decode_game_audio(&asset.bytes, &mut |member| {
+            let opened = open_resource_variant(resource_manager, member, AUDIO_EXTENSIONS)?;
+            Ok(opened.bytes)
+        });
+        let data = match decoded {
+            Ok(data) => data,
+            Err(err) => {
+                log::warn!(
+                    "[trace-audio] decode category={category} slot={slot} asset={:?} failed: {err}",
+                    asset.name
+                );
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        let handle = match audio.load_static_data(asset.name.clone(), data, group) {
             Ok(handle) => handle,
             Err(err) => {
                 log::warn!(
@@ -11076,6 +11162,10 @@ impl ScriptRuntime {
                 return ExtCallOutcome::Value(0);
             }
         };
+        if let Some((start, end)) = loop_samples {
+            let _ = audio.set_loop_samples(handle, start, end);
+            let _ = audio.set_start_end(handle, start as i32, end as i32);
+        }
         let volume = PalVolume::from_raw(volume_percent.clamp(0, 100).saturating_mul(100));
         let _ = audio.set_channel_volume(handle, volume);
         let effective_volume = audio
@@ -12437,7 +12527,9 @@ const IMAGE_EXTENSIONS: &[&str] = &["", ".PGD", ".pgd"];
 const FONT_SHEET_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
 const MASK_IMAGE_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
 const ANIMATION_EXTENSIONS: &[&str] = &["", ".ANI", ".ani"];
-const AUDIO_EXTENSIONS: &[&str] = &["", ".OGG", ".ogg", ".WAV", ".wav"];
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "", ".OGG", ".ogg", ".WAV", ".wav", ".WMA", ".wma", ".MIX", ".mix",
+];
 const MOVIE_EXTENSIONS: &[&str] = &["", ".WMV", ".wmv", ".MPG", ".mpg", ".MP4", ".mp4"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
