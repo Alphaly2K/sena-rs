@@ -11,7 +11,9 @@ use crate::event::PalEvent;
 use crate::input::PalInputState;
 use crate::platform_time::{Duration, Instant};
 use crate::runtime::{RuntimeStatus, RuntimeTick, ScriptRuntime, ScriptRuntimeConfig, WaitRequest};
-use crate::scene::FrameScene;
+use crate::scene::{
+    rasterize_scene_rgba, DrawCommand, FrameScene, RectF, SceneTexture, SceneTextureId, SpriteDraw,
+};
 use crate::sprite::SpriteSystem;
 use crate::task::TaskSystem;
 
@@ -65,6 +67,8 @@ pub struct Engine {
     input: PalInputState,
     window_physical_size: (u32, u32),
     pal_debug: bool,
+    last_scene: Option<FrameScene>,
+    active_crossfade: Option<(u32, SceneTexture)>,
 }
 
 impl Engine {
@@ -150,6 +154,8 @@ impl Engine {
             input: PalInputState::new(),
             window_physical_size: fallback_size,
             pal_debug: pal_debug_enabled(),
+            last_scene: None,
+            active_crossfade: None,
         })
     }
 
@@ -495,7 +501,28 @@ impl Engine {
 
         self.audio.update();
 
+        let effect = self.runtime.as_ref().and_then(ScriptRuntime::effect_state);
+        if let Some(effect) = effect.filter(|effect| effect.effect_id == 1) {
+            if self.active_crossfade.as_ref().map(|(start, _)| *start) != Some(effect.start_ms) {
+                self.active_crossfade = self.last_scene.as_ref().map(|previous| {
+                    (
+                        effect.start_ms,
+                        SceneTexture::rgba8(
+                            SceneTextureId(u64::MAX),
+                            effect.start_ms as u64,
+                            previous.logical_width,
+                            previous.logical_height,
+                            rasterize_scene_rgba(previous),
+                        ),
+                    )
+                });
+            }
+        } else {
+            self.active_crossfade = None;
+        }
+
         let scene = self.compose_scene(timing.elapsed, logical_width, logical_height);
+        self.last_scene = Some(scene.clone());
 
         if self.pal_debug || pal_debug_frame_enabled(timing.frame_index) {
             let frame_events = runtime_tick
@@ -634,7 +661,34 @@ impl Engine {
         }
         scene.commands.extend(sprite_commands);
         if let Some(runtime) = self.runtime.as_ref() {
-            if let Some(quad) = runtime.effect_overlay(logical_width, logical_height) {
+            let effect = runtime.effect_state();
+            if let Some((start, texture)) = self.active_crossfade.as_ref().filter(|(start, _)| {
+                effect.is_some_and(|effect| effect.effect_id == 1 && effect.start_ms == *start)
+            }) {
+                let effect = effect.unwrap();
+                let elapsed = self.task_system.pal_time_ms.wrapping_sub(*start);
+                let alpha =
+                    1.0 - (elapsed as f32 / effect.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+                if alpha > 0.0 {
+                    scene.textures.push(texture.clone());
+                    scene.commands.push(DrawCommand::Sprite(SpriteDraw {
+                        texture_id: texture.id,
+                        priority: i32::MAX,
+                        dst: RectF::new(0.0, 0.0, logical_width as f32, logical_height as f32),
+                        src: RectF::new(0.0, 0.0, texture.width as f32, texture.height as f32),
+                        source_rect: [0, 0, texture.width as i32, texture.height as i32],
+                        texture_size: [texture.width, texture.height],
+                        cell_size: [texture.width, texture.height],
+                        position: [0.0; 3],
+                        offset: [0; 2],
+                        color: [1.0, 1.0, 1.0, alpha],
+                        scale: 1.0,
+                        rotation: [0.0; 3],
+                        center_offset: [0.0; 2],
+                        render_mode: 0,
+                    }));
+                }
+            } else if let Some(quad) = runtime.effect_overlay(logical_width, logical_height) {
                 scene
                     .commands
                     .push(crate::scene::DrawCommand::SolidQuad(quad));
