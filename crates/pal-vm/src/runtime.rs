@@ -2953,14 +2953,9 @@ impl ScriptRuntime {
             }
             // kind 0x6: MemDatDirect — read from writable Mem.dat shadow.
             OperandKind::MemDatDirect => self.read_mem_dat_i32(operand),
-            // kind 0x7: MemDatIndirect — complex double-indirection, not yet implemented.
-            OperandKind::MemDatIndirect => {
-                log::warn!(
-                    "MemDatIndirect operand not implemented (raw=0x{:08X}), returning 0",
-                    operand.raw
-                );
-                Ok(0)
-            }
+            // kind 0x7: MemDatIndirect — Game.exe 0x42116b loads mem[bank+4]
+            // and resolves that word as a direct operand, keeping this lo.
+            OperandKind::MemDatIndirect => self.read_mem_dat_indirect(operand),
         };
         if self.vm_trace_enabled() {
             if let Ok(v) = result {
@@ -3033,18 +3028,12 @@ impl ScriptRuntime {
             // kind 0x6: MemDatDirect — write to the writable shadow copy.
             OperandKind::MemDatDirect => {
                 let word_index = self.mem_dat_word_index(operand)?;
-                if word_index >= self.mem_dat_words.len() {
-                    self.mem_dat_words.resize(word_index + 1, 0);
-                }
-                self.mem_dat_words[word_index] = value;
+                self.write_mem_dat_word(word_index, value);
                 Ok(())
             }
-            // kind 0x7: MemDatIndirect write — not yet implemented, log and ignore.
             OperandKind::MemDatIndirect => {
-                log::warn!(
-                    "MemDatIndirect operand write not implemented (raw=0x{:08X}), ignoring",
-                    operand.raw
-                );
+                let word_index = self.mem_dat_indirect_word_index(operand)?;
+                self.write_mem_dat_word(word_index, value);
                 Ok(())
             }
             // kind 0x8: ArgumentStack — write to arg_area[arg_top - lo].
@@ -3126,6 +3115,11 @@ impl ScriptRuntime {
         Ok(self.mem_dat_words.get(word_index).copied().unwrap_or(0))
     }
 
+    fn read_mem_dat_indirect(&self, operand: Operand) -> Result<i32, RuntimeError> {
+        let word_index = self.mem_dat_indirect_word_index(operand)?;
+        Ok(self.mem_dat_words.get(word_index).copied().unwrap_or(0))
+    }
+
     fn write_mem_dat_word(&mut self, word_index: usize, value: i32) {
         if word_index >= self.mem_dat_words.len() {
             self.mem_dat_words.resize(word_index + 1, 0);
@@ -3134,11 +3128,39 @@ impl ScriptRuntime {
     }
 
     fn mem_dat_word_index(&self, operand: Operand) -> Result<usize, RuntimeError> {
+        self.mem_dat_word_index_parts(operand.bank as i32, operand.lo)
+    }
+
+    /// Game.exe `0x42116b` handles tag `0x70000000` by loading `mem[bank + 4]`
+    /// and falling into the direct resolver. The loaded word supplies the
+    /// direct bank; the original operand keeps its variable slot.
+    fn mem_dat_indirect_word_index(&self, operand: Operand) -> Result<usize, RuntimeError> {
+        let pointer_index = self.mem_dat_header_index(operand.bank as i32)?;
+        let loaded = self
+            .mem_dat_words
+            .get(pointer_index)
+            .copied()
+            .unwrap_or(0) as u32;
+        let inner_bank = ((loaded >> 16) & 0x0FFF) as i32;
+        self.mem_dat_word_index_parts(inner_bank, operand.lo)
+    }
+
+    fn mem_dat_header_index(&self, bank: i32) -> Result<usize, RuntimeError> {
+        let signed = bank.wrapping_add(4);
+        if signed < 0 {
+            return Err(RuntimeError::MemDatOutOfRange {
+                offset: 0,
+                len: self.mem_dat_words.len() * 4,
+            });
+        }
+        Ok(signed as usize)
+    }
+
+    fn mem_dat_word_index_parts(&self, bank: i32, var_slot: u16) -> Result<usize, RuntimeError> {
         // Original formula: mem_dat_ptr + 4*(bank + vars[lo]) + 16.
         // The "+16" skips the 16-byte header present in Mem.dat. Scripts also
         // use this area as mutable work storage, so writes can extend the shadow.
-        let bank = operand.bank as i32;
-        let var_val = self.read_var(operand.lo as usize)?;
+        let var_val = self.read_var(var_slot as usize)?;
         let signed_word_index = bank.wrapping_add(var_val).wrapping_add(4);
         if signed_word_index < 0 {
             return Err(RuntimeError::MemDatOutOfRange {
