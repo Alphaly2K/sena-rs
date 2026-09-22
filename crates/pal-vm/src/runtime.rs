@@ -112,6 +112,31 @@ fn decode_pal_sprite_slot(slot: i32) -> Option<(i32, Option<u8>)> {
     }
 }
 
+fn apply_graphic_record_lanes(
+    desc: &mut SpriteDesc,
+    record: &crate::assets::GraphicRecord,
+    fade_replace: bool,
+) {
+    if record.priority_lane != 0 {
+        desc.base_priority = desc
+            .base_priority
+            .saturating_add(record.priority_lane.saturating_mul(134));
+    }
+    if record.offset_x != 0 || record.offset_y != 0 {
+        desc.position.x += record.offset_x as f32;
+        desc.position.y += record.offset_y as f32;
+    }
+    // A zero scale dword with the 0x100000 bit set collapses the sprite. Native
+    // files in these installs store 0 there, so only a positive percent overrides.
+    if record.scale_percent > 0 && record.scale_percent != 100 {
+        desc.scale *= record.scale_percent as f32 / 100.0;
+    }
+    if !fade_replace && record.flags & 0x80000 != 0 {
+        let rgb = (record.alpha as u32) & 0x00FF_FFFF;
+        desc.color = PalColor::from_argb(0xFF00_0000 | rgb);
+    }
+}
+
 fn game_sprite_priority(slot: i32) -> i32 {
     let slot_order = slot.clamp(0, 999);
     // PalSprite::effective_priority() adds position.z.  The base priority is
@@ -8102,6 +8127,7 @@ impl ScriptRuntime {
             }
         }
         let mut graphic_animation_name = None;
+        let mut graphic_record = None;
         if let Some(record) = assets
             .graphic_index
             .as_ref()
@@ -8109,13 +8135,17 @@ impl ScriptRuntime {
         {
             if let Some(replacement) = record.replacement_resource() {
                 log::debug!(
-                    "[trace-sprite] sp_set graphic.dat key={name:?} image={replacement:?} animation={:?} flags=0x{:X}",
+                    "[trace-sprite] sp_set graphic.dat key={name:?} image={replacement:?} animation={:?} flags=0x{:X} priority={} scale={} tint={:#x}",
                     record.animation_resource(),
-                    record.flags
+                    record.flags,
+                    record.priority_lane,
+                    record.scale_percent,
+                    record.alpha
                 );
                 name = replacement;
             }
             graphic_animation_name = record.animation_resource();
+            graphic_record = Some(record.clone());
         }
         if let (Some(old_anim), Some(task_system)) =
             (self.game_sprite_animations.remove(&slot), task_system)
@@ -8246,6 +8276,9 @@ impl ScriptRuntime {
         desc.visible = true;
         if fade_replace {
             desc.color = PalColor::from_argb(0x00FF_FFFF);
+        }
+        if let Some(record) = graphic_record.as_ref() {
+            apply_graphic_record_lanes(&mut desc, record, fade_replace);
         }
         desc.source_name = asset.name.clone();
         let handle = sprites.create(desc);
