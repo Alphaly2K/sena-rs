@@ -4785,6 +4785,39 @@ impl ScriptRuntime {
             15 => return self.ext_btn_enable(sprites),
             16 => return self.ext_btn_set_alpha(sprites),
             17 => return self.ext_btn_get_push(input, sprites.as_deref()),
+            41 => {
+                // This button-register form takes (group, index) on the value
+                // stack. Its caller's argument frame keeps the resource name
+                // and callback immediately below them. Preserve that frame
+                // while creating the PAL button sprite and hit target.
+                let args = self.pop_ext_args(2);
+                if args.len() < 2 {
+                    return ExtCallOutcome::Value(0);
+                }
+                let Some(&name_value) = self.stack.last() else {
+                    return ExtCallOutcome::Value(0);
+                };
+                let group = args[0];
+                let index = args[1];
+                let callback = self
+                    .stack
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|offset| self.stack.get(offset))
+                    .copied()
+                    .unwrap_or(0);
+                log::debug!("[trace-button] btn_register_frame group={group} index={index} resource={name_value} resolved={:?}", self.resolve_resource_string(name_value, assets, nls));
+                self.stack.extend_from_slice(&[
+                    1,
+                    0x0FFF_FFFF,
+                    0x0FFF_FFFF,
+                    callback,
+                    name_value,
+                    index,
+                    group,
+                ]);
+                return self.ext_btn_set(assets, nls, resource_manager, sprites);
+            }
             18 => return self.ext_btn_expansion(sprites),
             19 => return self.ext_btn_lock(),
             20 => return self.ext_btn_unlock(sprites),
@@ -4795,7 +4828,6 @@ impl ScriptRuntime {
         }
         let arity = match index {
             13 => 2,
-            41 => 2,
             42 => 3,
             43 | 45 | 50 | 52 | 53 | 54 | 57 | 58 => 1,
             44 | 46 => 0,
