@@ -185,9 +185,20 @@ impl PalFontFallback {
 
             if let Some(outlined) = self.font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
+                // Some fallback fonts place shorter glyphs a pixel or two
+                // above the bottom of the ideographic cell. PAL text uses a
+                // shared cell baseline, so align substantial short glyphs to
+                // that baseline while leaving centered marks and low commas
+                // at their font-defined positions.
+                let y_shift = glyph_baseline_shift(
+                    bounds.min.y as i32,
+                    bounds.max.y as i32,
+                    baseline_y,
+                    px_height,
+                );
                 outlined.draw(|gx, gy, cov| {
                     let px = bounds.min.x as i32 + gx as i32;
-                    let py = bounds.min.y as i32 + gy as i32;
+                    let py = bounds.min.y as i32 + gy as i32 + y_shift;
                     if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
                         return;
                     }
@@ -203,6 +214,14 @@ impl PalFontFallback {
 
         (w as u32, h as u32, pixels)
     }
+}
+
+fn glyph_baseline_shift(min_y: i32, max_y: i32, ascent: f32, cell_height: f32) -> i32 {
+    if (max_y - min_y) as f32 <= cell_height * 0.45 {
+        return 0;
+    }
+    let baseline_bottom = ascent.ceil() as i32 - 1;
+    (baseline_bottom - (max_y - 1)).clamp(0, (cell_height * 0.1).ceil() as i32)
 }
 
 const SYSTEM_CJK_FONT_CANDIDATES: &[&str] = &[
@@ -279,6 +298,14 @@ fn apply_text_edge(src: &[u8], width: u32, height: u32, edge: [u8; 4]) -> (u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_glyphs_share_the_cell_baseline_without_moving_centered_marks() {
+        assert_eq!(glyph_baseline_shift(7, 23, 24.0, 28.0), 1);
+        assert_eq!(glyph_baseline_shift(7, 22, 24.0, 28.0), 2);
+        assert_eq!(glyph_baseline_shift(12, 16, 24.0, 28.0), 0);
+        assert_eq!(glyph_baseline_shift(18, 25, 24.0, 28.0), 0);
+    }
 
     #[test]
     fn default_ttf_loads() {
