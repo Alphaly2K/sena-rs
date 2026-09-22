@@ -114,6 +114,28 @@ impl SpriteSystem {
         Some(self.create(desc))
     }
 
+    /// Copy a sprite's current surface pixels into a new sprite at the same
+    /// position. Used by `get_backbuffer` / `PalSpriteBackBafferCopy`.
+    pub fn copy_sprite_pixels(
+        &mut self,
+        source: SpriteHandle,
+        priority: i32,
+        source_name: impl Into<String>,
+    ) -> Option<SpriteHandle> {
+        let sprite = self.get(source)?;
+        let position = sprite.position;
+        let surface_id = sprite.surface;
+        let texture = self.surface(surface_id)?.to_scene_texture();
+        self.create_rgba_sprite(
+            texture.width,
+            texture.height,
+            texture.pixels.to_vec(),
+            position,
+            priority,
+            source_name,
+        )
+    }
+
     pub fn create_msprite(
         &mut self,
         decoder: MSpriteHandle,
@@ -2152,5 +2174,38 @@ impl PalRenderMode {
 
     pub const fn raw(self) -> u32 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_sprite_pixels_duplicates_the_source_surface() {
+        let mut sprites = SpriteSystem::new();
+        let pixels = vec![9, 8, 7, 255, 1, 2, 3, 128];
+        let source = sprites
+            .create_rgba_sprite(
+                2,
+                1,
+                pixels.clone(),
+                PalVec3::from_f32(12.0, 34.0, 1.0),
+                4,
+                "source",
+            )
+            .expect("source sprite");
+        let copied = sprites
+            .copy_sprite_pixels(source, i32::MIN / 2, "backbuffer")
+            .expect("copied sprite");
+        let copied_sprite = sprites.get(copied).expect("copied handle");
+        assert_eq!(copied_sprite.position.x, 12.0);
+        assert_eq!(copied_sprite.position.y, 34.0);
+        let texture = sprites
+            .surface(copied_sprite.surface)
+            .expect("copied surface")
+            .to_scene_texture();
+        assert_eq!(texture.pixels.as_ref(), pixels.as_slice());
+        assert_ne!(copied, source);
     }
 }

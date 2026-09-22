@@ -259,6 +259,8 @@ pub struct ScriptRuntime {
     file_handles: Vec<Option<RuntimeFile>>,
     /// Game script image slots mapped to PAL sprite handles.
     game_sprites: BTreeMap<i32, SpriteHandle>,
+    /// Sprite surface copied by `get_backbuffer` (`PalSpriteBackBafferCopy`).
+    backbuffer_sprite: Option<SpriteHandle>,
     /// PAL transition handles keyed by script transition slot.
     game_sprite_transitions: BTreeMap<i32, SpriteTransitionHandle>,
     /// Native sprite transition source image lane. Game.exe keeps the previous
@@ -987,6 +989,7 @@ impl ScriptRuntime {
             extcall_dst_raw: 0,
             file_handles: Vec::new(),
             game_sprites: BTreeMap::new(),
+            backbuffer_sprite: None,
             game_sprite_transitions: BTreeMap::new(),
             game_sprite_transition_sources: BTreeMap::new(),
             game_sprite_animations: BTreeMap::new(),
@@ -6809,7 +6812,7 @@ impl ScriptRuntime {
             51 => self.ext_sp_copy_image(sprites),
             52 => self.ext_sp_transition(sprites),
             53 => self.ext_sp_set_aspect_position_type(sprites),
-            54 => self.ext_sp_get_backbuffer(),
+            54 => self.ext_sp_get_backbuffer(sprites),
             55 => self.ext_sp_set_mask(assets, nls, resource_manager, sprites),
             56 => self.ext_sp_set_motion_pos(assets, nls, resource_manager, sprites),
             57 => self.ext_sp_set_anim(assets, nls, resource_manager, sprites, task_system),
@@ -9036,16 +9039,34 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Game category 3 index 54 (`sub_424620`) pops a sprite slot and copies
-    /// its current PAL image into the backbuffer. The portable renderer rebuilds
-    /// the scene every frame, so this is represented as a stack-disciplined draw
-    /// flush for now.
-    fn ext_sp_get_backbuffer(&mut self) -> ExtCallOutcome {
+    /// Game category 3 index 54 (`sub_41A680` in this Koikake build) pops a
+    /// sprite slot and calls `PalSpriteBackBafferCopy` on that sprite's surface.
+    /// The copy is kept as its own sprite so the pixels survive after the source
+    /// slot is replaced, and it is drawn behind later sprites.
+    fn ext_sp_get_backbuffer(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let Some(slot) = args.first().copied() else {
             return ExtCallOutcome::Block;
         };
-        log::debug!("[trace-sprite] get_backbuffer slot={slot}");
+        if !(-1..=0x80).contains(&slot) {
+            log::debug!("[trace-sprite] get_backbuffer slot={slot} out of range");
+            return ExtCallOutcome::Value(0);
+        }
+        let Some(sprites) = sprites else {
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(source) = self.game_sprites.get(&slot).copied() else {
+            log::debug!("[trace-sprite] get_backbuffer slot={slot} empty");
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(copied) = sprites.copy_sprite_pixels(source, i32::MIN / 2, "backbuffer") else {
+            log::debug!("[trace-sprite] get_backbuffer slot={slot} copy failed");
+            return ExtCallOutcome::Value(1);
+        };
+        if let Some(previous) = self.backbuffer_sprite.replace(copied) {
+            sprites.release(previous);
+        }
+        log::debug!("[trace-sprite] get_backbuffer slot={slot} copied");
         ExtCallOutcome::Value(1)
     }
 
