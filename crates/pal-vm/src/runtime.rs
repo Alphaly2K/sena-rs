@@ -2750,6 +2750,12 @@ impl ScriptRuntime {
                     }
                 }
             }
+            25 => {
+                // reset_adv: argc 0. Clears the ADV text window so the next line
+                // starts without the previous wait mark or reveal.
+                self.reset_adv();
+                self.vm_trace(format_args!("  op reset_adv"));
+            }
             24 => {
                 let Some(return_pc) = self.call_stack.pop() else {
                     return Err(RuntimeError::ReturnStackUnderflow { pc: insn_pc });
@@ -5092,6 +5098,17 @@ impl ScriptRuntime {
             }
             _ => ExtCallOutcome::Skip,
         }
+    }
+
+    fn reset_adv(&mut self) {
+        self.text_state.visible = false;
+        self.text_state.show_wait_mark = false;
+        self.text_state.reveal_enabled = false;
+        self.text_state.reveal_duration_ms = 0;
+        self.text_state.last_text_value = 0;
+        self.text_state.last_text_args = [0; 4];
+        self.text_state.pending_alpha.clear();
+        self.text_state.dirty = true;
     }
 
     fn thumbnail_size_or_default(&self) -> (i32, i32) {
