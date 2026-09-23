@@ -676,7 +676,9 @@ impl Engine {
                         texture_id: texture.id,
                         priority: i32::MAX,
                         dst: RectF::new(0.0, 0.0, logical_width as f32, logical_height as f32),
-                        src: RectF::new(0.0, 0.0, texture.width as f32, texture.height as f32),
+                        // Renderer UVs are normalized. Pixel dimensions here sample
+                        // only the last texel, so the previous warning image never fades.
+                        src: RectF::new(0.0, 0.0, 1.0, 1.0),
                         source_rect: [0, 0, texture.width as i32, texture.height as i32],
                         texture_size: [texture.width, texture.height],
                         cell_size: [texture.width, texture.height],
