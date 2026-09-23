@@ -146,6 +146,11 @@ fn game_sprite_priority(slot: i32) -> i32 {
     slot_order
 }
 
+// Save-slot button surfaces use priority 100. `thumbnail_set` and the save
+// text draw calls paint onto their shared canvas in PAL; when represented as
+// separate sprites they must sit above those translucent button surfaces.
+const SAVE_DRAWING_PRIORITY: i32 = 101;
+
 #[derive(Clone, Debug)]
 pub enum FrameEvent {
     ExtCallSkipped {
@@ -5505,7 +5510,7 @@ impl ScriptRuntime {
             height,
             pixels,
             PalVec3::from_f32(x as f32, y as f32, 0.0),
-            game_sprite_priority(slot),
+            SAVE_DRAWING_PRIORITY,
             format!("thumbnail:{save_slot}"),
         ) else {
             return ExtCallOutcome::Value(0);
@@ -5733,14 +5738,14 @@ impl ScriptRuntime {
                 format!("save-time:{filename}:{text}"),
             );
             let _ = sprites.set_pos(handle, x, y, 0);
-            let _ = sprites.set_priority(handle, 4866 + game_sprite_priority(sprite_slot));
+            let _ = sprites.set_priority(handle, SAVE_DRAWING_PRIORITY);
             let _ = sprites.view_ctrl(handle, true);
         } else if let Some(handle) = sprites.create_rgba_sprite(
             width,
             height,
             rgba,
             PalVec3::new(x, y, 0),
-            4866 + game_sprite_priority(sprite_slot),
+            SAVE_DRAWING_PRIORITY,
             format!("save-time:{filename}:{text}"),
         ) {
             self.save_state
@@ -5846,14 +5851,14 @@ impl ScriptRuntime {
                 format!("{label}:{text}"),
             );
             let _ = sprites.set_pos(handle, x, y, 0);
-            let _ = sprites.set_priority(handle, 4866 + game_sprite_priority(sprite_slot));
+            let _ = sprites.set_priority(handle, SAVE_DRAWING_PRIORITY);
             let _ = sprites.view_ctrl(handle, true);
         } else if let Some(handle) = sprites.create_rgba_sprite(
             width,
             height,
             rgba,
             PalVec3::new(x, y, 0),
-            4866 + game_sprite_priority(sprite_slot),
+            SAVE_DRAWING_PRIORITY,
             format!("{label}:{text}"),
         ) {
             self.save_state
@@ -15988,13 +15993,18 @@ mod tests {
             .save_state
             .thumbnail_sprites
             .values()
-            .all(|handle| sprites.get(*handle).is_some_and(|sprite| sprite.draw_command(&sprites).is_some())));
+            .all(|handle| sprites.get(*handle).is_some_and(|sprite| {
+                sprite.effective_priority() == SAVE_DRAWING_PRIORITY
+                    && sprite.color.alpha() == 255
+                    && sprite.draw_command(&sprites).is_some()
+            })));
         runtime.stack.extend_from_slice(&[60, 200, 1, 77]);
         runtime.ext_save_text_draw(Some(&mut manager), Some(&mut sprites));
         assert_eq!(runtime.save_state.text_sprites.len(), 1);
         let text_handle = *runtime.save_state.text_sprites.values().next().unwrap();
         let text_sprite = sprites.get(text_handle).unwrap();
         assert!(text_sprite.source_name.contains("保存1"));
+        assert_eq!(text_sprite.effective_priority(), SAVE_DRAWING_PRIORITY);
         assert!(text_sprite.draw_command(&sprites).is_some());
         assert!(sprites
             .surface(text_sprite.surface)
