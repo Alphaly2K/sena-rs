@@ -7225,7 +7225,8 @@ impl ScriptRuntime {
                 false,
             ),
             4 => self.ext_sp_set_pos_ex(sprites),
-            5 | 11 | 13 => self.ext_sp_cls(sprites, task_system),
+            5 | 13 => self.ext_sp_cls(sprites, task_system),
+            11 => self.ext_sp_cls_ex(sprites, task_system),
             6 => self.ext_sp_set_alpha(sprites),
             7 => self.ext_sp_set_priority_lane(),
             8 => self.ext_sp_get_filename(sprites),
@@ -9774,6 +9775,33 @@ impl ScriptRuntime {
             }
         }
         log::debug!("[trace-msprite] msp_stop slot={slot}");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `sp_cls_ex(first, count)` clears a consecutive range of sprite slots.
+    /// The confirmation popup creates its canvas and frame in adjacent slots.
+    fn ext_sp_cls_ex(
+        &mut self,
+        mut sprites: Option<&mut SpriteSystem>,
+        mut task_system: Option<&mut TaskSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let first = args[0];
+        let count = args[1].clamp(0, 1000);
+        if first == -1 {
+            self.stack.push(-1);
+            return self.ext_sp_cls(sprites, task_system);
+        }
+        for offset in 0..count {
+            let Some(slot) = first.checked_add(offset) else {
+                break;
+            };
+            self.stack.push(slot);
+            let _ = self.ext_sp_cls(sprites.as_deref_mut(), task_system.as_deref_mut());
+        }
         ExtCallOutcome::Value(1)
     }
 
@@ -16071,6 +16099,35 @@ mod tests {
         let encoded = Nls::ShiftJis.encode(title).expect("native title");
         assert_eq!(decode_save_title(&encoded, Nls::ShiftJis), title);
         assert_eq!(decode_save_title(title.as_bytes(), Nls::ShiftJis), title);
+    }
+
+    #[test]
+    fn sprite_range_clear_removes_the_popup_frame() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        for slot in [125, 126, 127] {
+            let handle = sprites
+                .create_rgba_sprite(
+                    2,
+                    2,
+                    vec![255; 16],
+                    PalVec3::new(0, 0, 0),
+                    slot,
+                    format!("popup:{slot}"),
+                )
+                .unwrap();
+            runtime.game_sprites.insert(slot, handle);
+        }
+        runtime.stack.extend_from_slice(&[2, 126]);
+        assert!(matches!(
+            runtime.ext_sp_cls_ex(Some(&mut sprites), None),
+            ExtCallOutcome::Value(1)
+        ));
+        assert!(runtime.stack.is_empty());
+        assert!(runtime.game_sprites.contains_key(&125));
+        assert!(!runtime.game_sprites.contains_key(&126));
+        assert!(!runtime.game_sprites.contains_key(&127));
+        assert_eq!(sprites.commands().len(), 1);
     }
 
     #[test]

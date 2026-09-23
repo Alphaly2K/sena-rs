@@ -834,11 +834,11 @@ static SIG_SP_SET_FILTER: ExtSig = sig!(3, 12, "set_filter", pop=2,
     evidence=[GameSqlite:"reverse/Game.sqlite decompilation search for set_filter wrapper", PalSqlite:"PalSpriteSetRenderMode 0x1011B4F8 / Game import thunk 0x4506BE", RuntimeTrace:"pal-vm dispatch_sprite_ext index 12 pops 2"]);
 /// category 3 index 11: sp_cls_ex
 ///
-/// Purpose: Extended sprite clear; VM shares the sp_cls release path.
-/// Alias for sp_cls with the same single-slot pop convention.
+/// Purpose: Clear a consecutive range of sprite slots.
 ///
 /// VM arguments:
-/// - pop[0]: slot (SpriteSlot) — sprite slot index to release.
+/// - pop[0]: first_slot (SpriteSlot) — first sprite slot to release.
+/// - pop[1]: count (Integer) — number of consecutive slots.
 ///
 /// Return: void.
 ///
@@ -847,17 +847,18 @@ static SIG_SP_SET_FILTER: ExtSig = sig!(3, 12, "set_filter", pop=2,
 /// Evidence:
 /// - Game.sqlite: reverse/Game.sqlite sprite dispatch shares 3:0005/000B/000D clear path
 /// - PAL.sqlite: PalSpriteRelease 0x10120D45 / Game import thunk 0x45049E
-/// - RuntimeTrace: pal-vm dispatch_sprite_ext index 11 pops 1
+/// - Koikake Script.src: `sp_cls_ex(126, 2)` releases the popup canvas and
+///   its adjacent frame sprite after a choice is made.
 ///
-/// Engine: Blocked — releases slot via PalSpriteRelease.
+/// Engine: Blocked — releases each slot via PalSpriteRelease.
 ///
-/// Decompiler: Blocked — renders as sp_cls_ex(slot).
-static SIG_SP_CLS_EX: ExtSig = sig!(3, 11, "sp_cls_ex", pop=1,
-    params=["slot":0=SpriteSlot],
+/// Decompiler: Blocked — renders as sp_cls_ex(first_slot, count).
+static SIG_SP_CLS_EX: ExtSig = sig!(3, 11, "sp_cls_ex", pop=2,
+    params=["first_slot":0=SpriteSlot, "count":1=Integer],
     return=Void, effects=[DeletesSprite],
-    purpose="Extended sprite clear alias; VM shares the sp_cls release path.",
+    purpose="Clear count consecutive sprite slots from first_slot.",
     status=Blocked, decompiler=Blocked,
-    evidence=[GameSqlite:"reverse/Game.sqlite sprite dispatch shares 3:0005/000B/000D clear path", PalSqlite:"PalSpriteRelease 0x10120D45 / Game import thunk 0x45049E", RuntimeTrace:"pal-vm dispatch_sprite_ext index 11 pops 1"]);
+    evidence=[GameSqlite:"reverse/Game.sqlite sprite dispatch shares 3:0005/000B/000D clear path", PalSqlite:"PalSpriteRelease 0x10120D45 / Game import thunk 0x45049E", RuntimeTrace:"Koikake Script.src popup teardown pushes count 2 then first_slot 126"]);
 /// category 3 index 17: sp_set_scale
 ///
 /// Purpose: Set the display scale lane of a sprite slot.
