@@ -3600,9 +3600,13 @@ impl ScriptRuntime {
                 "save_point_lock" => {
                     return self.dispatch_save_stub(36, assets, nls, resource_manager, sprites);
                 }
-                "system_btn_set" => return self.dispatch_system_button_stub(0),
-                "system_btn_release" => return self.dispatch_system_button_stub(1),
-                "system_btn_enable" => return self.dispatch_system_button_stub(2),
+                "system_btn_set" if category == 12 => return self.dispatch_system_button_stub(0),
+                "system_btn_release" if category == 12 => {
+                    return self.dispatch_system_button_stub(1)
+                }
+                "system_btn_enable" if category == 12 => {
+                    return self.dispatch_system_button_stub(2)
+                }
                 "history_init_0x_0x" => return self.dispatch_history_stub(0),
                 "historybegin_lpbyte_ptagdata_sztext" => return self.dispatch_history_stub(1),
                 "history_end" => return self.dispatch_history_stub(2),
@@ -5129,8 +5133,7 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             24 => {
-                let args = self.pop_ext_args(1);
-                self.save_state.last_result = args.first().copied().unwrap_or(0);
+                self.pop_ext_args(0);
                 ExtCallOutcome::Value(1)
             }
             25 => {
@@ -5982,10 +5985,15 @@ impl ScriptRuntime {
                 self.pop_ext_args(1);
             }
             4 => {
-                // Reachable category 15:4 callsites pass three arguments. The
-                // exact Game handler is still blocked, but preserving its stack
-                // contract is required before the following title/menu waits.
-                self.pop_ext_args(3);
+                // Later PAL scripts pass three arguments. Older scripts also
+                // prefix those values with five 0x0FFFFFFF sentinels. Consume
+                // the complete form so the function-frame base below it is not
+                // restored from a leftover sentinel during startup.
+                let extended = self.stack.len() >= 8
+                    && self.stack[self.stack.len() - 8..self.stack.len() - 3]
+                        .iter()
+                        .all(|&value| value == 0x0FFF_FFFF);
+                self.pop_ext_args(if extended { 8 } else { 3 });
             }
             5 => {
                 let args = self.pop_ext_args(1);
@@ -14640,6 +14648,34 @@ enum StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_window_overlay_consumes_both_pal_argument_forms() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        runtime.stack = vec![
+            77,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            1,
+            20,
+            11439,
+        ];
+        assert!(matches!(
+            runtime.dispatch_misc_system_stub(4),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, vec![77]);
+
+        runtime.stack = vec![88, 1, 20, 11439];
+        assert!(matches!(
+            runtime.dispatch_misc_system_stub(4),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, vec![88]);
+    }
 
     #[test]
     fn wait_mark_frame_uses_grayscale_as_coverage() {
