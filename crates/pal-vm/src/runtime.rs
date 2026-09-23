@@ -1087,7 +1087,37 @@ impl ScriptRuntime {
         if let Some(effect) = ini_first_int(&ini, "def_font_effect") {
             self.font_state.set_effect(effect.max(0) as u16);
         }
+        if let Some(font_type) = ini_first_int(&ini, "def_font_type") {
+            self.font_state.set_type(font_type.max(0) as u16);
+        }
         self.system_ini = Some(ini);
+    }
+
+    pub fn load_configured_font(&mut self, resource_manager: &mut ResourceManager, nls: Nls) {
+        let name = self
+            .system_ini
+            .as_ref()
+            .and_then(|ini| ini_first_str(ini, "add_fontname"))
+            .unwrap_or_else(|| "default_font".to_owned());
+        match open_resource_variant(resource_manager, &name, FONT_DATA_EXTENSIONS) {
+            Ok(asset) => match self.font_state.load_bitmap_font(asset.bytes, nls) {
+                Ok(()) => {
+                    if let Some(font_type) = self
+                        .system_ini
+                        .as_ref()
+                        .and_then(|ini| ini_first_int(ini, "def_font_type"))
+                    {
+                        self.font_state.set_type(font_type.max(0) as u16);
+                    }
+                    log::debug!("[trace-text] loaded PAL bitmap font {:?}", asset.name);
+                }
+                Err(err) => log::warn!(
+                    "[trace-text] PAL bitmap font {:?} is invalid: {err}",
+                    asset.name
+                ),
+            },
+            Err(err) => log::debug!("[trace-text] PAL bitmap font {name:?} unavailable: {err}"),
+        }
     }
 
     pub fn load_portable_system_data(&mut self, root: &Path) {
@@ -1632,7 +1662,12 @@ impl ScriptRuntime {
             558
         };
         let text_origin_x = text_draw_x.saturating_sub(x).max(0) as u32;
-        let text_origin_y = text_draw_y.saturating_sub(y).max(0) as u32;
+        // PAL leaves one line-gap above the ADV glyph cell. The bitmap font's
+        // tallest glyphs start at row zero, so omitting this leading makes the
+        // line sit visibly higher than the original renderer.
+        let text_leading = (u32::from(native_text_size) / 4).max(1);
+        let text_origin_y =
+            (text_draw_y.saturating_sub(y).max(0) as u32).saturating_add(text_leading);
         // Native PAL draws ADV text windows above scene sprites but below the
         // Game.exe button layer. Keeping the text surface at an extremely high
         // priority hides MAIN_BTN_LOG/SKIP/AUTO/SYSTEM/SAVE/LOAD even though the
@@ -13071,6 +13106,7 @@ fn is_dynamic_string_handle(value: i32) -> bool {
 
 const IMAGE_EXTENSIONS: &[&str] = &["", ".PGD", ".pgd"];
 const FONT_SHEET_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
+const FONT_DATA_EXTENSIONS: &[&str] = &["", ".DAT", ".dat"];
 const MASK_IMAGE_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
 const ANIMATION_EXTENSIONS: &[&str] = &["", ".ANI", ".ani"];
 const AUDIO_EXTENSIONS: &[&str] = &[

@@ -103,6 +103,7 @@ impl Engine {
                     if let Some(system_ini) = startup_config.system_ini.clone() {
                         runtime.set_system_ini(system_ini);
                     }
+                    runtime.load_configured_font(&mut resource_manager, config.nls);
                     // Initialise the writable Mem.dat shadow used by MemDatDirect writes.
                     runtime.load_mem_dat(&core_assets.mem_dat.bytes);
                     runtime.load_portable_system_data(root);

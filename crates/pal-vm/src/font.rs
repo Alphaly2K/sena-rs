@@ -1,10 +1,12 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use pal_asset::Nls;
 
 static DEFAULT_TTF_BYTES: &[u8] = include_bytes!("default.ttf");
 
 #[derive(Clone, Debug)]
 pub struct PalFontSystem {
     fallback: PalFontFallback,
+    bitmap: Option<PalBitmapFont>,
     begun: bool,
     font_size: u16,
     font_type: u16,
@@ -24,6 +26,7 @@ impl PalFontSystem {
     pub fn new() -> Self {
         Self {
             fallback: PalFontFallback::default_ttf(),
+            bitmap: None,
             begun: false,
             font_size: 28,
             font_type: 1,
@@ -35,7 +38,7 @@ impl PalFontSystem {
     }
 
     pub fn begin(&mut self) -> bool {
-        if self.font_type == 4 {
+        if self.font_type == 4 && self.bitmap.is_none() && !self.ex_font_loaded {
             self.font_type = 1;
         }
         self.begun = true;
@@ -77,7 +80,7 @@ impl PalFontSystem {
     }
 
     pub fn set_type(&mut self, font_type: u16) -> bool {
-        if font_type == 4 && !self.ex_font_loaded {
+        if font_type == 4 && self.bitmap.is_none() && !self.ex_font_loaded {
             return false;
         }
         self.font_type = font_type;
@@ -90,21 +93,41 @@ impl PalFontSystem {
 
     pub fn set_ex_font_loaded(&mut self, loaded: bool) {
         self.ex_font_loaded = loaded;
-        if !loaded && self.font_type == 4 {
+        if !loaded && self.bitmap.is_none() && self.font_type == 4 {
             self.font_type = 1;
         }
     }
 
+    pub fn load_bitmap_font(&mut self, bytes: Vec<u8>, nls: Nls) -> Result<(), &'static str> {
+        self.bitmap = Some(PalBitmapFont::parse(bytes, nls)?);
+        Ok(())
+    }
+
     pub fn measure(&self, text: &str) -> (u32, u32) {
         let font_size = f32::from(self.font_size.max(1));
+        if self.font_type == 4 {
+            if let Some(bitmap) = &self.bitmap {
+                if bitmap.supports(text) {
+                    return bitmap.measure_line(text, font_size);
+                }
+            }
+        }
         self.fallback.measure_line(text, font_size)
     }
 
     pub fn rasterize(&self, text: &str) -> (u32, u32, Vec<u8>) {
         let color = argb_to_bgra(self.color);
-        let (width, height, mut pixels) =
-            self.fallback
-                .rasterize_line(text, f32::from(self.font_size.max(1)), color);
+        let font_size = f32::from(self.font_size.max(1));
+        let (width, height, mut pixels) = if self.font_type == 4
+            && self.bitmap.as_ref().is_some_and(|font| font.supports(text))
+        {
+            self.bitmap
+                .as_ref()
+                .unwrap()
+                .rasterize_line(text, font_size, color)
+        } else {
+            self.fallback.rasterize_line(text, font_size, color)
+        };
         for px in pixels.chunks_exact_mut(4) {
             px.swap(0, 2);
         }
@@ -116,6 +139,176 @@ impl PalFontSystem {
             return (width, height, pixels);
         }
         apply_text_edge(&pixels, width, height, edge)
+    }
+}
+
+/// PAL's `DEFAULT_FONT.DAT` stores a direct lookup table followed by grayscale
+/// glyph records. Two-byte character codes use the native PAL slot mapping
+/// `(lead - 0x80) * 255 + trail`; the selected NLS converts rendered Unicode
+/// text back to those original byte codes.
+#[derive(Clone, Debug)]
+struct PalBitmapFont {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+    nls: Nls,
+    em_size: u32,
+    baseline: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PalBitmapGlyph<'a> {
+    width: u32,
+    height: u32,
+    bearing_x: i32,
+    bearing_y: i32,
+    advance: u32,
+    stride: u32,
+    alpha: &'a [u8],
+}
+
+impl PalBitmapFont {
+    fn parse(bytes: Vec<u8>, nls: Nls) -> Result<Self, &'static str> {
+        if bytes.len() < 0x84 {
+            return Err("font data is too short");
+        }
+        let first_offset = u32::from_le_bytes(bytes[0x80..0x84].try_into().unwrap()) as usize;
+        if first_offset < 0x84 || first_offset > bytes.len() || first_offset % 4 != 0 {
+            return Err("font lookup table has an invalid size");
+        }
+        let offsets = bytes[..first_offset]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        if offsets
+            .iter()
+            .any(|&offset| offset != 0 && offset as usize >= bytes.len())
+        {
+            return Err("font lookup table points outside the resource");
+        }
+        Ok(Self {
+            bytes,
+            offsets,
+            nls,
+            em_size: 28,
+            baseline: 24,
+        })
+    }
+
+    fn slot_for_char(&self, ch: char) -> Option<usize> {
+        let encoded = self.nls.encode(&ch.to_string()).ok()?;
+        match encoded.as_slice() {
+            [byte] => Some(usize::from(*byte)),
+            [lead, trail] if *lead >= 0x80 => Some(
+                usize::from(*lead - 0x80)
+                    .saturating_mul(255)
+                    .saturating_add(usize::from(*trail)),
+            ),
+            _ => None,
+        }
+    }
+
+    fn glyph(&self, ch: char) -> Option<PalBitmapGlyph<'_>> {
+        let slot = self.slot_for_char(ch)?;
+        let offset = *self.offsets.get(slot)? as usize;
+        if offset == 0 || offset.checked_add(24)? > self.bytes.len() {
+            return None;
+        }
+        let field = |index: usize| {
+            u32::from_le_bytes(
+                self.bytes[offset + index * 4..offset + index * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let width = field(0);
+        let height = field(1);
+        let bearing_x = field(2) as i32;
+        let bearing_y = field(3) as i32;
+        let advance = field(4);
+        let bitmap_len = field(5) as usize;
+        let start = offset + 24;
+        let end = start.checked_add(bitmap_len)?;
+        let alpha = self.bytes.get(start..end)?;
+        let stride = (width + 3) & !3;
+        if bitmap_len != 0 && bitmap_len != stride as usize * height as usize {
+            return None;
+        }
+        Some(PalBitmapGlyph {
+            width,
+            height,
+            bearing_x,
+            bearing_y,
+            advance,
+            stride,
+            alpha,
+        })
+    }
+
+    fn supports(&self, text: &str) -> bool {
+        text.chars().all(|ch| self.glyph(ch).is_some())
+    }
+
+    fn measure_line(&self, text: &str, px_height: f32) -> (u32, u32) {
+        let scale = px_height / self.em_size as f32;
+        let width = text
+            .chars()
+            .map(|ch| self.glyph(ch).map_or(self.em_size, |glyph| glyph.advance) as f32 * scale)
+            .sum::<f32>()
+            .ceil() as u32;
+        (width.max(1), px_height.ceil().max(1.0) as u32)
+    }
+
+    fn rasterize_line(
+        &self,
+        text: &str,
+        px_height: f32,
+        color_bgra: [u8; 4],
+    ) -> (u32, u32, Vec<u8>) {
+        let (width, height) = self.measure_line(text, px_height);
+        let scale = px_height / self.em_size as f32;
+        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+        let mut cursor_x = 0.0_f32;
+        for ch in text.chars() {
+            let Some(glyph) = self.glyph(ch) else {
+                cursor_x += self.em_size as f32 * scale;
+                continue;
+            };
+            if glyph.alpha.is_empty() {
+                cursor_x += glyph.advance as f32 * scale;
+                continue;
+            }
+            let left = cursor_x + glyph.bearing_x as f32 * scale;
+            let top = (self.baseline - glyph.bearing_y) as f32 * scale;
+            let draw_width = (glyph.width as f32 * scale).ceil().max(1.0) as u32;
+            let draw_height = (glyph.height as f32 * scale).ceil().max(1.0) as u32;
+            for dy in 0..draw_height {
+                let sy = ((dy as f32 / scale).floor() as u32).min(glyph.height.saturating_sub(1));
+                let py = top.floor() as i32 + dy as i32;
+                if py < 0 || py >= height as i32 {
+                    continue;
+                }
+                for dx in 0..draw_width {
+                    let sx =
+                        ((dx as f32 / scale).floor() as u32).min(glyph.width.saturating_sub(1));
+                    let px = left.floor() as i32 + dx as i32;
+                    if px < 0 || px >= width as i32 {
+                        continue;
+                    }
+                    let coverage = glyph.alpha[(sy * glyph.stride + sx) as usize].min(64);
+                    if coverage == 0 {
+                        continue;
+                    }
+                    let alpha = ((u16::from(coverage) * u16::from(color_bgra[3]) + 32) / 64) as u8;
+                    let index = (py as usize * width as usize + px as usize) * 4;
+                    pixels[index] = color_bgra[0];
+                    pixels[index + 1] = color_bgra[1];
+                    pixels[index + 2] = color_bgra[2];
+                    pixels[index + 3] = pixels[index + 3].max(alpha);
+                }
+            }
+            cursor_x += glyph.advance as f32 * scale;
+        }
+        (width, height, pixels)
     }
 }
 
@@ -268,17 +461,28 @@ fn apply_text_edge(src: &[u8], width: u32, height: u32, edge: [u8; 4]) -> (u32, 
     for y in 0..height {
         for x in 0..width {
             let src_index = (y as usize * width as usize + x as usize) * 4;
-            if src.get(src_index + 3).copied().unwrap_or(0) == 0 {
+            let source_alpha = src.get(src_index + 3).copied().unwrap_or(0);
+            if source_alpha == 0 {
                 continue;
             }
             let ox = x as i32 + pad as i32;
             let oy = y as i32 + pad as i32;
+            let mut edge_pixel = edge;
+            edge_pixel[3] = ((u16::from(edge[3]) * u16::from(source_alpha) + 127) / 255) as u8;
             for dy in -1..=1 {
                 for dx in -1..=1 {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
-                    stamp(&mut dst, ox + dx, oy + dy, &edge);
+                    let index = ((oy + dy) as usize * out_w as usize + (ox + dx) as usize) * 4;
+                    if ox + dx >= 0
+                        && oy + dy >= 0
+                        && ox + dx < out_w as i32
+                        && oy + dy < out_h as i32
+                        && dst[index + 3] < edge_pixel[3]
+                    {
+                        dst[index..index + 4].copy_from_slice(&edge_pixel);
+                    }
                 }
             }
         }
@@ -298,6 +502,18 @@ fn apply_text_edge(src: &[u8], width: u32, height: u32, edge: [u8; 4]) -> (u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitmap_font_fixture() -> Vec<u8> {
+        let table_end = 0x108_u32;
+        let mut bytes = vec![0_u8; table_end as usize];
+        bytes[0x80..0x84].copy_from_slice(&table_end.to_le_bytes());
+        bytes[0x104..0x108].copy_from_slice(&table_end.to_le_bytes());
+        for value in [2_u32, 2, 1, 2, 4, 8] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[64, 0, 0, 0, 0, 32, 0, 0]);
+        bytes
+    }
 
     #[test]
     fn short_glyphs_share_the_cell_baseline_without_moving_centered_marks() {
@@ -336,6 +552,21 @@ mod tests {
         let ink = |pixels: &[u8]| pixels.chunks_exact(4).filter(|px| px[3] > 0).count();
         assert!(ink(&edged) > ink(&plain));
         assert!(edged.chunks_exact(4).any(|px| px[0] == 255 && px[3] > 0));
+    }
+
+    #[test]
+    fn bitmap_font_uses_pal_metrics_and_grayscale_coverage() {
+        let mut font = PalFontSystem::new();
+        font.load_bitmap_font(bitmap_font_fixture(), Nls::ShiftJis)
+            .unwrap();
+        font.set_type(4);
+        font.set_font_size(28);
+        font.set_effect(0);
+        let (width, height, pixels) = font.rasterize("A");
+        assert_eq!((width, height), (4, 28));
+        let alpha = |x: usize, y: usize| pixels[(y * width as usize + x) * 4 + 3];
+        assert_eq!(alpha(1, 22), 255);
+        assert_eq!(alpha(2, 23), 128);
     }
 
     #[test]
