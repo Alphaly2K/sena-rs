@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::io::{Cursor, Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,14 +23,14 @@ use crate::input::{PalInputState, PalMouseButton};
 use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
 use crate::save_format::{
     composite_thumbnail, decode_original_save, encode_original_save, mosaic_rgba,
-    original_save_filename, original_save_path, patch_lock_dword, read_lock_dword,
+    original_prefix_len, original_save_filename, original_save_path, read_lock_dword,
     OriginalSavePrefix, ThumbnailSprite, DEFAULT_THUMB_HEIGHT, DEFAULT_THUMB_WIDTH,
-    LOAD_THUMBNAIL_CAPTURE_SENTINEL, MOSAIC_FACTOR,
+    HEADER_BEFORE_PIXELS, LOAD_THUMBNAIL_CAPTURE_SENTINEL, MOSAIC_FACTOR,
 };
 use crate::scene::{FrameScene, SceneTextureId, SolidQuad};
 use crate::sprite::{
-    PalAnimationFlags, PalColor, PalRect, PalRenderMode, PalVec3, SpriteDesc, SpriteHandle,
-    SpriteKind, SpriteSurface, SpriteSystem, SpriteTransitionHandle,
+    PalAnimationFlags, PalColor, PalPoint2, PalRect, PalRenderMode, PalVec3, SpriteDesc,
+    SpriteHandle, SpriteKind, SpriteSurface, SpriteSystem, SpriteTransitionHandle,
 };
 use crate::system::PalRandomState;
 use crate::system::PalSystemState;
@@ -233,6 +234,8 @@ pub struct ScriptRuntime {
     /// Engine checks this handle after task_system.process() to detect task completion.
     wait_task_handle: Option<TaskHandle>,
     wait_task_kind: Option<WaitRequest>,
+    /// Set only by the ADV `wait_click(-1)` path for the current blocked step.
+    adv_wait_checkpoint_pending: bool,
     /// Cached PAL time in milliseconds, injected by Engine once per frame.
     pal_time_ms: u32,
     /// Game.exe wait_sync_begin stores PaltimeGetTime() at runtime offset +655248.
@@ -797,15 +800,77 @@ struct SaveSubsystemState {
     font_effect: i32,
     font_color: i32,
     locked: bool,
+    /// Set by `savepoint` and cleared by `save_point_clear`. Native `save`
+    /// returns success without writing when this latch is clear.
+    armed: bool,
     locks: BTreeMap<i32, i32>,
+    /// Slot stored when `save` is called with a non-zero remember flag.
+    remembered_slot: i32,
     last_slot: i32,
     last_result: i32,
+    /// VM image captured at the last `savepoint`, written by a later `save`.
+    checkpoint: Option<RuntimeSaveSnapshot>,
+    /// Most recent ADV wait before the save menu changes the scene.
+    resume_checkpoint: Option<RuntimeSaveSnapshot>,
     snapshots: BTreeMap<i32, RuntimeSaveSnapshot>,
-    text_sprites: BTreeMap<i32, SpriteHandle>,
+    text_sprites: BTreeMap<(i32, i32, i32), SpriteHandle>,
+    thumbnail_sprites: BTreeMap<(i32, i32, i32), SpriteHandle>,
+}
+
+/// `savepoint(1000)` clears the captured image. Koikake `sub_422E20`.
+const SAVEPOINT_CLEAR_SLOT: i32 = 1000;
+const SAVE_SPRITE_CAP: usize = 128;
+const SAVE_SPRITE_BYTES_CAP: usize = 8 * 1024 * 1024;
+const SAVE_MEMDAT_CAP: usize = 65_536;
+const SAVE_NAME_CAP: usize = 256;
+
+#[derive(Clone, Debug)]
+struct SavedSprite {
+    slot: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    offset_x: i32,
+    offset_y: i32,
+    priority: i32,
+    scale_bits: u32,
+    color: u32,
+    visible: bool,
+    rect: [i32; 4],
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedButton {
+    group: i32,
+    index: i32,
+    visible: bool,
+    enabled: bool,
+    alpha: u8,
+    gosub_point: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    priority: i32,
+    width: u32,
+    height: u32,
+    name: String,
+    rgba: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedButtonGroup {
+    group: i32,
+    normal_image: i32,
+    hover_image: i32,
+    onmouse_index: i32,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeSaveSnapshot {
+    version: u32,
     pc: u32,
     call_stack: Vec<u32>,
     user_mem: Vec<i32>,
@@ -817,6 +882,23 @@ struct RuntimeSaveSnapshot {
     text_base: i32,
     text_mode: i32,
     text_visible: bool,
+    vars: Vec<i32>,
+    stack: Vec<i32>,
+    argument_stack: Vec<i32>,
+    argument_base: i32,
+    text_initialized: bool,
+    text_init_args: [i32; 8],
+    text_color: u32,
+    text_effect_color: u32,
+    show_wait_mark: bool,
+    resume_wait_click: bool,
+    title_bytes: Vec<u8>,
+    thumb_width: i32,
+    thumb_height: i32,
+    thumb_pixels: Vec<u8>,
+    sprites: Vec<SavedSprite>,
+    buttons: Vec<SavedButton>,
+    button_groups: Vec<SavedButtonGroup>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -993,6 +1075,7 @@ impl ScriptRuntime {
             trace: config.trace,
             wait_task_handle: None,
             wait_task_kind: None,
+            adv_wait_checkpoint_pending: false,
             pal_time_ms: 0,
             wait_sync_begin_ms: 0,
             wait_sync_release: None,
@@ -2391,6 +2474,29 @@ impl ScriptRuntime {
                 }
                 Ok(StepResult::BlockedWithWait(req)) => {
                     executed += 1;
+                    let is_adv_wait = std::mem::take(&mut self.adv_wait_checkpoint_pending);
+                    if self.save_state.armed && is_adv_wait && matches!(req, WaitRequest::Click) {
+                        let mut snapshot = self.capture_resumable_scene(sprites.as_deref());
+                        snapshot.resume_wait_click = true;
+                        let (body, name) = self.adv_text_parts_for_render(
+                            assets,
+                            resource_manager
+                                .as_deref()
+                                .map_or(Nls::ShiftJis, ResourceManager::nls),
+                        );
+                        let title = if name.is_empty() {
+                            body
+                        } else if body.is_empty() {
+                            name
+                        } else {
+                            format!("{name} {body}")
+                        };
+                        let (title, _) = parse_pal_text_directives(&title);
+                        if !title.is_empty() {
+                            snapshot.title_bytes = title.into_bytes();
+                        }
+                        self.save_state.resume_checkpoint = Some(snapshot);
+                    }
                     let events = std::mem::take(&mut self.frame_events);
                     return Ok(RuntimeTick {
                         executed,
@@ -3096,19 +3202,11 @@ impl ScriptRuntime {
                 };
                 let var_val = self.read_var(operand.lo as usize)?;
                 let signed_idx = base.wrapping_add(var_val);
-                if signed_idx < 0 {
-                    log::debug!(
-                        "TempMemoryViaVar write out of range: idx={} bank={} var={}",
-                        signed_idx,
-                        bank,
-                        var_val
-                    );
+                let Some(idx) =
+                    checked_script_mem_index("temp_mem", signed_idx, self.temp_mem.len())
+                else {
                     return Ok(());
-                }
-                let idx = signed_idx as usize;
-                if idx >= self.temp_mem.len() {
-                    self.temp_mem.resize(idx + 1, 0);
-                }
+                };
                 self.temp_mem[idx] = value;
                 Ok(())
             }
@@ -3723,6 +3821,7 @@ impl ScriptRuntime {
     }
 
     fn dispatch_wait_ext(&mut self, index: u16) -> ExtCallOutcome {
+        self.adv_wait_checkpoint_pending = false;
         match index {
             // wait(duration_ms,skip_cancel): Game.exe sub_444F40 pops two
             // values, records start time, and rewinds the PC until the duration
@@ -3762,6 +3861,7 @@ impl ScriptRuntime {
                     if self.text_state.visible && self.text_state.last_text_value != 0 {
                         self.text_state.show_wait_mark = true;
                         self.text_state.dirty = true;
+                        self.adv_wait_checkpoint_pending = true;
                         ExtCallOutcome::Wait {
                             value: 1,
                             request: WaitRequest::Click,
@@ -4824,45 +4924,32 @@ impl ScriptRuntime {
             15 => return self.ext_btn_enable(sprites),
             16 => return self.ext_btn_set_alpha(sprites),
             17 => return self.ext_btn_get_push(input, sprites.as_deref()),
-            41 => {
-                // This button-register form takes (group, index) on the value
-                // stack. Its caller's argument frame keeps the resource name
-                // and callback immediately below them. Preserve that frame
-                // while creating the PAL button sprite and hit target.
-                let args = self.pop_ext_args(2);
-                if args.len() < 2 {
-                    return ExtCallOutcome::Value(0);
-                }
-                let Some(&name_value) = self.stack.last() else {
-                    return ExtCallOutcome::Value(0);
-                };
-                let group = args[0];
-                let index = args[1];
-                let callback = self
-                    .stack
-                    .len()
-                    .checked_sub(2)
-                    .and_then(|offset| self.stack.get(offset))
-                    .copied()
-                    .unwrap_or(0);
-                log::debug!("[trace-button] btn_register_frame group={group} index={index} resource={name_value} resolved={:?}", self.resolve_resource_string(name_value, assets, nls));
-                self.stack.extend_from_slice(&[
-                    1,
-                    0x0FFF_FFFF,
-                    0x0FFF_FFFF,
-                    callback,
-                    name_value,
-                    index,
-                    group,
-                ]);
-                return self.ext_btn_set(assets, nls, resource_manager, sprites);
-            }
             18 => return self.ext_btn_expansion(sprites),
             19 => return self.ext_btn_lock(),
             20 => return self.ext_btn_unlock(sprites),
             21 => return self.ext_btn_set_anim(assets, nls, resource_manager, sprites),
             22 => return self.ext_btn_set_hit(),
             23 => return self.ext_btn_get_onmouse(input, sprites.as_deref()),
+            41 => {
+                // The table-driven button constructor carries the regular
+                // btn_set fields followed by its source rectangle dimensions.
+                // All thirteen values belong to this extcall; leaving the
+                // lower eleven on the value stack makes the caller restore
+                // argument_base from a resource sentinel after title setup.
+                let args = self.pop_ext_args(13);
+                if args.len() < 13 {
+                    return ExtCallOutcome::Value(0);
+                }
+                let group = args[0];
+                let index = args[1];
+                let name_value = args[2];
+                let callback = args[3];
+                log::debug!("[trace-button] btn_register_frame group={group} index={index} resource={name_value} resolved={:?}", self.resolve_resource_string(name_value, assets, nls));
+                self.stack.extend_from_slice(&[
+                    args[6], args[5], args[4], callback, name_value, index, group,
+                ]);
+                return self.ext_btn_set(assets, nls, resource_manager, sprites);
+            }
             _ => {}
         }
         let arity = match index {
@@ -4935,18 +5022,19 @@ impl ScriptRuntime {
 
     /// Game category 10 save/load extcalls.
     ///
-    /// Files follow Koikake's `save/save%03d.dat` prefix: lock dword, title,
-    /// mosaic flag, and the thumbnail RGBA `thumbnail_set` reads at `0x224`.
-    /// A `SENARSAV` trailer keeps this runtime's VM snapshot so load can restore
-    /// script state. Native `save` pops `(slot, flag)` and still returns 1 when
-    /// the slot is out of range.
+    /// `savepoint` arms saving, while each ADV click wait refreshes the
+    /// resumable VM and scene before the save menu is opened. `save` writes
+    /// that image to `save/save%03d.dat`; `load` restores it. The file prefix
+    /// carries the lock dword, title, and thumbnail RGBA `thumbnail_set` reads
+    /// at `0x224`. Native `save` pops `(slot, flag)` and still returns 1 when
+    /// the slot is out of range or no savepoint is armed.
     fn dispatch_save_stub(
         &mut self,
         index: u16,
         assets: &CoreAssets,
         nls: Nls,
         mut resource_manager: Option<&mut ResourceManager>,
-        sprites: Option<&mut SpriteSystem>,
+        mut sprites: Option<&mut SpriteSystem>,
     ) -> ExtCallOutcome {
         match index {
             0 => {
@@ -4954,68 +5042,97 @@ impl ScriptRuntime {
                 let slot = args.first().copied().unwrap_or(0);
                 let remember = args.get(1).copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
+                if !self.save_state.armed || self.save_state.checkpoint.is_none() {
+                    log::debug!("[trace-save] save slot={slot} skipped, no savepoint");
+                    self.save_state.last_result = 1;
+                    return ExtCallOutcome::Value(1);
+                }
                 if !(0..1000).contains(&slot) {
                     log::debug!("[trace-save] save rejected slot={slot}");
                     self.save_state.last_result = 1;
                     return ExtCallOutcome::Value(1);
                 }
                 if remember != 0 {
-                    self.save_state.last_slot = slot;
+                    self.save_state.remembered_slot = slot;
                 }
-                if let Some(sprites) = sprites.as_deref() {
-                    if self.save_state.capture_from_screen
-                        || self.save_state.thumbnail_pixels.is_empty()
-                    {
-                        self.capture_thumbnail(sprites);
+                let mut snapshot = self
+                    .resumable_save_snapshot()
+                    .expect("armed savepoint has a checkpoint");
+                // Keep the pre-menu VM and scene, while taking the current
+                // title and thumbnail from the actual save operation.
+                {
+                    let (body, name) = self.adv_text_parts_for_render(assets, nls);
+                    let title = if name.is_empty() {
+                        body
+                    } else if body.is_empty() {
+                        name
+                    } else {
+                        format!("{name} {body}")
+                    };
+                    let (title, _) = parse_pal_text_directives(&title);
+                    if !title.is_empty() {
+                        snapshot.title_bytes = title.into_bytes();
                     }
                 }
-                let snapshot = self.capture_save_snapshot();
-                self.save_state.snapshots.insert(slot, snapshot);
-                if let (Some(manager), Some(snapshot)) = (
-                    resource_manager.as_deref(),
-                    self.save_state.snapshots.get(&slot),
-                ) {
-                    match self.write_original_save(manager.root(), slot, snapshot) {
-                        Ok(path) => {
-                            log::debug!("[trace-save] save slot={slot} file={}", path.display())
-                        }
+                if let Some(sprites_ref) = sprites.as_deref() {
+                    // The thumbnail was captured when the menu opened
+                    // (`thumbnail_renew`), before the menu covered the scene.
+                    // Re-capturing here would snapshot the menu itself. Only
+                    // fall back to a fresh capture when nothing was stored.
+                    if self.save_state.thumbnail_pixels.is_empty() {
+                        self.capture_thumbnail(sprites_ref);
+                    }
+                    snapshot.thumb_width = self.save_state.thumbnail_size[0];
+                    snapshot.thumb_height = self.save_state.thumbnail_size[1];
+                    snapshot.thumb_pixels = self.save_state.thumbnail_pixels.clone();
+                }
+                self.save_state.snapshots.insert(slot, snapshot.clone());
+                if let Some(manager) = resource_manager.as_deref() {
+                    match self.write_original_save(manager.root(), slot, &snapshot, nls) {
+                        Ok(path) => log::debug!(
+                            "[trace-save] save slot={slot} pc=0x{:08X} file={}",
+                            snapshot.pc,
+                            path.display()
+                        ),
                         Err(err) => {
                             log::warn!("[trace-save] save slot={slot} file failed: {err}")
                         }
                     }
                 }
                 self.save_state.last_result = 1;
-                log::debug!("[trace-save] save slot={slot} original_file=true");
                 ExtCallOutcome::Value(1)
             }
             1 => {
                 let args = self.pop_ext_args(1);
                 let slot = args.first().copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
-                if let Some(manager) = resource_manager.as_deref() {
-                    if let Ok(prefix) = read_original_save_prefix(manager.root(), slot) {
-                        self.save_state.locks.insert(slot, prefix.lock);
-                        self.save_state.mosaic_enabled = prefix.mosaic != 0;
-                        if prefix.thumb_width > 0 && prefix.thumb_height > 0 {
-                            self.save_state.thumbnail_size =
-                                [prefix.thumb_width, prefix.thumb_height];
-                            self.save_state.thumbnail_pixels = prefix.pixels;
-                        }
-                        if !prefix.title.is_empty() {
-                            self.save_state.title_bytes = prefix.title;
-                        }
-                    }
-                }
-                let snapshot = self.save_state.snapshots.get(&slot).cloned().or_else(|| {
-                    resource_manager
-                        .as_deref()
-                        .and_then(|manager| read_runtime_save_snapshot(manager.root(), slot).ok())
-                });
+                let snapshot = resource_manager
+                    .as_deref()
+                    .and_then(|manager| read_runtime_save_snapshot(manager.root(), slot).ok())
+                    .or_else(|| self.save_state.snapshots.get(&slot).cloned());
                 if let Some(snapshot) = snapshot {
+                    let scene = snapshot.clone();
+                    let resume_wait_click = snapshot.resume_wait_click;
                     self.restore_save_snapshot(snapshot);
+                    if let Some(sprites) = sprites.as_deref_mut() {
+                        self.restore_checkpoint_scene(&scene, sprites);
+                    }
+                    self.wait_task_handle = None;
+                    self.wait_task_kind = None;
                     self.save_state.last_result = 1;
-                    log::debug!("[trace-save] load slot={slot} snapshot=true");
-                    return ExtCallOutcome::Value(1);
+                    log::debug!(
+                        "[trace-save] load slot={slot} pc=0x{:08X} sprites={}",
+                        self.pc,
+                        scene.sprites.len()
+                    );
+                    return if resume_wait_click {
+                        ExtCallOutcome::Wait {
+                            value: 1,
+                            request: WaitRequest::Click,
+                        }
+                    } else {
+                        ExtCallOutcome::Value(1)
+                    };
                 }
                 let has_file = resource_manager
                     .as_ref()
@@ -5023,9 +5140,14 @@ impl ScriptRuntime {
                         find_loose_save_file(manager.root(), &original_save_filename(slot))
                     })
                     .is_some();
-                self.save_state.last_result = i32::from(has_file);
-                log::debug!("[trace-save] load slot={slot} file={has_file}");
-                ExtCallOutcome::Value(self.save_state.last_result)
+                self.save_state.last_result = 0;
+                if has_file {
+                    log::warn!(
+                        "[trace-save] load slot={slot} file present but has no resumable snapshot"
+                    );
+                }
+                log::debug!("[trace-save] load slot={slot} file={has_file} snapshot=false");
+                ExtCallOutcome::Value(0)
             }
             2 => {
                 let args = self.pop_ext_args(1);
@@ -5058,11 +5180,25 @@ impl ScriptRuntime {
             }
             30 => self.ext_copy_save_file(resource_manager),
             31 => self.ext_load_thumbnail(assets, nls, resource_manager, sprites),
-            3 | 6 | 14 | 16 | 21 | 28 | 29 | 35 => {
-                self.pop_ext_args(match index {
-                    3 | 6 | 14 | 16 | 21 | 28 | 29 => 1,
-                    _ => 0,
-                });
+            14 => self.ext_save_day_draw(resource_manager, sprites),
+            16 => self.ext_save_text_draw(resource_manager, sprites),
+            17 => {
+                log::debug!(
+                    "[trace-save] get_new_savefile slot={}",
+                    self.save_state.remembered_slot
+                );
+                ExtCallOutcome::Value(self.save_state.remembered_slot.max(0))
+            }
+            28 => self.ext_delete_save_file(resource_manager),
+            35 => {
+                self.save_state.armed = false;
+                self.save_state.checkpoint = None;
+                self.save_state.resume_checkpoint = None;
+                log::debug!("[trace-save] save_point_clear");
+                ExtCallOutcome::Value(1)
+            }
+            3 | 6 | 21 | 29 => {
+                self.pop_ext_args(1);
                 ExtCallOutcome::Value(1)
             }
             4 => {
@@ -5095,7 +5231,7 @@ impl ScriptRuntime {
                             .is_file()
                             .then_some(portable_save_path(manager.root(), slot))
                             .or_else(|| {
-                                find_loose_save_file(manager.root(), &format!("save{slot:03}.dat"))
+                                find_loose_save_file(manager.root(), &original_save_filename(slot))
                             })
                     })
                     .is_some();
@@ -5106,7 +5242,7 @@ impl ScriptRuntime {
                 );
                 ExtCallOutcome::Value(self.save_state.last_result)
             }
-            10 | 17 => {
+            10 => {
                 self.pop_ext_args(1);
                 ExtCallOutcome::Value(0)
             }
@@ -5122,9 +5258,36 @@ impl ScriptRuntime {
             }
             11 => {
                 let args = self.pop_ext_args(1);
-                self.save_state.last_slot = args.first().copied().unwrap_or(0);
-                self.save_state.last_result = if self.save_state.locked { 0 } else { 1 };
-                ExtCallOutcome::Value(self.save_state.last_result)
+                let slot = args.first().copied().unwrap_or(0);
+                self.save_state.last_slot = slot;
+                if slot == SAVEPOINT_CLEAR_SLOT {
+                    self.save_state.armed = false;
+                    self.save_state.checkpoint = None;
+                    self.save_state.resume_checkpoint = None;
+                    log::debug!("[trace-save] savepoint clear");
+                    return ExtCallOutcome::Value(1);
+                }
+                if self.save_state.locked {
+                    log::debug!("[trace-save] savepoint locked, keeping previous image");
+                    self.save_state.last_result = 1;
+                    return ExtCallOutcome::Value(1);
+                }
+                self.capture_save_checkpoint(assets, nls, sprites.as_deref());
+                self.save_state.last_result = 1;
+                log::debug!(
+                    "[trace-save] savepoint pc=0x{:08X} sprites={}",
+                    self.save_state
+                        .checkpoint
+                        .as_ref()
+                        .map(|snapshot| snapshot.pc)
+                        .unwrap_or(0),
+                    self.save_state
+                        .checkpoint
+                        .as_ref()
+                        .map(|snapshot| snapshot.sprites.len())
+                        .unwrap_or(0)
+                );
+                ExtCallOutcome::Value(1)
             }
             32 => self.ext_save_lock(resource_manager),
             23 => {
@@ -5152,7 +5315,7 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             27 => {
-                let args = self.pop_ext_args(1);
+                let args = self.pop_ext_args(2);
                 self.save_state.font_color = args.first().copied().unwrap_or(0);
                 ExtCallOutcome::Value(1)
             }
@@ -5162,8 +5325,12 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(i32::from(self.save_state.last_result != 0))
             }
             36 => {
-                self.pop_ext_args(0);
-                self.save_state.locked = true;
+                let args = self.pop_ext_args(1);
+                self.save_state.locked = args.first().copied().unwrap_or(0) != 0;
+                log::debug!(
+                    "[trace-save] save_point_lock locked={}",
+                    self.save_state.locked
+                );
                 ExtCallOutcome::Value(1)
             }
             _ => ExtCallOutcome::Skip,
@@ -5266,8 +5433,23 @@ impl ScriptRuntime {
         root: &Path,
         slot: i32,
         snapshot: &RuntimeSaveSnapshot,
+        nls: Nls,
     ) -> std::io::Result<PathBuf> {
-        let prefix = self.current_save_prefix(slot);
+        let mut prefix = self.current_save_prefix(slot);
+        if !snapshot.title_bytes.is_empty() {
+            prefix.title = std::str::from_utf8(&snapshot.title_bytes)
+                .ok()
+                .and_then(|title| nls.encode(title).ok())
+                .unwrap_or_else(|| snapshot.title_bytes.clone());
+        }
+        if snapshot.thumb_width > 0
+            && snapshot.thumb_height > 0
+            && !snapshot.thumb_pixels.is_empty()
+        {
+            prefix.thumb_width = snapshot.thumb_width;
+            prefix.thumb_height = snapshot.thumb_height;
+            prefix.pixels = snapshot.thumb_pixels.clone();
+        }
         let snapshot_bytes = encode_runtime_save_snapshot(snapshot)?;
         let bytes = encode_original_save(&prefix, &snapshot_bytes);
         let path = original_save_path(root, slot);
@@ -5308,7 +5490,7 @@ impl ScriptRuntime {
         let Some(sprites) = sprites else {
             return ExtCallOutcome::Value(1);
         };
-        if let Some(old) = self.game_sprites.remove(&slot) {
+        if let Some(old) = self.save_state.thumbnail_sprites.remove(&(slot, x, y)) {
             sprites.release(old);
         }
         let width = prefix.thumb_width.max(1) as u32;
@@ -5328,7 +5510,9 @@ impl ScriptRuntime {
         ) else {
             return ExtCallOutcome::Value(0);
         };
-        self.game_sprites.insert(slot, handle);
+        self.save_state
+            .thumbnail_sprites
+            .insert((slot, x, y), handle);
         log::debug!(
             "[trace-save] thumbnail_set slot={slot} save_slot={save_slot} pos=({x},{y}) size={width}x{height}"
         );
@@ -5446,15 +5630,8 @@ impl ScriptRuntime {
             log::debug!("[trace-save] save_lock slot={slot} missing");
             return ExtCallOutcome::Value(1);
         }
-        match std::fs::read(&path) {
-            Ok(mut bytes) => {
-                if patch_lock_dword(&mut bytes, value) {
-                    if let Err(err) = std::fs::write(&path, bytes) {
-                        log::warn!("[trace-save] save_lock slot={slot} write failed: {err}");
-                    }
-                }
-            }
-            Err(err) => log::warn!("[trace-save] save_lock slot={slot} read failed: {err}"),
+        if let Err(err) = write_save_lock_dword(&path, value) {
+            log::warn!("[trace-save] save_lock slot={slot} write failed: {err}");
         }
         log::debug!("[trace-save] save_lock slot={slot} value={value}");
         ExtCallOutcome::Value(1)
@@ -5470,8 +5647,10 @@ impl ScriptRuntime {
         self.save_state.last_slot = slot;
         let from_file = resource_manager.as_ref().and_then(|manager| {
             let path = find_loose_save_file(manager.root(), &original_save_filename(slot))?;
-            let bytes = std::fs::read(path).ok()?;
-            Some(read_lock_dword(&bytes))
+            let mut file = File::open(path).ok()?;
+            let mut header = [0_u8; 8];
+            file.read_exact(&mut header).ok()?;
+            Some(read_lock_dword(&header))
         });
         let value = from_file
             .or_else(|| self.save_state.locks.get(&slot).copied())
@@ -5540,7 +5719,12 @@ impl ScriptRuntime {
             .set_font_size(self.save_state.font_size.max(18) as u16);
         let (width, height, rgba) = self.font_state.rasterize(&text);
         self.font_state.set_font_size(saved_size);
-        if let Some(handle) = self.save_state.text_sprites.get(&sprite_slot).copied() {
+        if let Some(handle) = self
+            .save_state
+            .text_sprites
+            .get(&(sprite_slot, x, y))
+            .copied()
+        {
             let _ = sprites.replace_sprite_surface(
                 handle,
                 width,
@@ -5559,13 +5743,173 @@ impl ScriptRuntime {
             4866 + game_sprite_priority(sprite_slot),
             format!("save-time:{filename}:{text}"),
         ) {
-            self.save_state.text_sprites.insert(sprite_slot, handle);
+            self.save_state
+                .text_sprites
+                .insert((sprite_slot, x, y), handle);
         }
         log::debug!(
             "[trace-save] savetimedraw slot={sprite_slot} save_slot={save_slot} path={} text={text:?} pos=({x},{y}) mode={format_mode}",
             path.display()
         );
         ExtCallOutcome::Value(1)
+    }
+
+    /// `savedaydraw` pops `(sprite, save_slot, x, y, format)` and paints the
+    /// file date. A missing file still returns 1.
+    fn ext_save_day_draw(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(5);
+        if args.len() < 5 {
+            return ExtCallOutcome::Block;
+        }
+        let text = save_file_modified(resource_manager.as_deref(), args[1])
+            .map(|modified| format_save_day(modified, args[4]))
+            .unwrap_or_default();
+        if text.is_empty() {
+            return ExtCallOutcome::Value(1);
+        }
+        self.place_save_label(sprites, args[0], args[2], args[3], &text, "save-day");
+        log::debug!(
+            "[trace-save] savedaydraw slot={} save_slot={} text={text:?} pos=({},{})",
+            args[0],
+            args[1],
+            args[2],
+            args[3]
+        );
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `savetextdraw` pops `(sprite, save_slot, x, y)` and paints the title
+    /// stored at offset 8. A missing file still returns 1.
+    fn ext_save_text_draw(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(4);
+        if args.len() < 4 {
+            return ExtCallOutcome::Block;
+        }
+        let title = resource_manager
+            .as_deref()
+            .and_then(|manager| {
+                read_original_save_prefix(manager.root(), args[1])
+                    .ok()
+                    .map(|prefix| decode_save_title(&prefix.title, manager.nls()))
+            })
+            .unwrap_or_default();
+        if title.is_empty() {
+            return ExtCallOutcome::Value(1);
+        }
+        self.place_save_label(sprites, args[0], args[2], args[3], &title, "save-text");
+        log::debug!(
+            "[trace-save] savetextdraw slot={} save_slot={} text={title:?} pos=({},{})",
+            args[0],
+            args[1],
+            args[2],
+            args[3]
+        );
+        ExtCallOutcome::Value(1)
+    }
+
+    fn place_save_label(
+        &mut self,
+        sprites: Option<&mut SpriteSystem>,
+        sprite_slot: i32,
+        x: i32,
+        y: i32,
+        text: &str,
+        label: &str,
+    ) {
+        let Some(sprites) = sprites else {
+            return;
+        };
+        let saved_size = self.font_state.font_size();
+        self.font_state
+            .set_font_size(self.save_state.font_size.max(16) as u16);
+        let (width, height, rgba) = self.font_state.rasterize(text);
+        self.font_state.set_font_size(saved_size);
+        if let Some(handle) = self
+            .save_state
+            .text_sprites
+            .get(&(sprite_slot, x, y))
+            .copied()
+        {
+            let _ = sprites.replace_sprite_surface(
+                handle,
+                width,
+                height,
+                rgba,
+                format!("{label}:{text}"),
+            );
+            let _ = sprites.set_pos(handle, x, y, 0);
+            let _ = sprites.set_priority(handle, 4866 + game_sprite_priority(sprite_slot));
+            let _ = sprites.view_ctrl(handle, true);
+        } else if let Some(handle) = sprites.create_rgba_sprite(
+            width,
+            height,
+            rgba,
+            PalVec3::new(x, y, 0),
+            4866 + game_sprite_priority(sprite_slot),
+            format!("{label}:{text}"),
+        ) {
+            self.save_state
+                .text_sprites
+                .insert((sprite_slot, x, y), handle);
+        }
+    }
+
+    fn clear_save_drawings(&mut self, sprites: &mut SpriteSystem, slot: i32) {
+        self.save_state
+            .text_sprites
+            .retain(|(target, _, _), handle| {
+                if slot == -1 || *target == slot {
+                    sprites.release(*handle);
+                    false
+                } else {
+                    true
+                }
+            });
+        self.save_state
+            .thumbnail_sprites
+            .retain(|(target, _, _), handle| {
+                if slot == -1 || *target == slot {
+                    sprites.release(*handle);
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
+    /// `delete_file` pops a slot. `-1` removes `continue.dat`. The destination
+    /// receives 1 only when a file was actually removed.
+    fn ext_delete_save_file(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(1);
+        let slot = args.first().copied().unwrap_or(0);
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(0);
+        };
+        let path = find_loose_save_file(manager.root(), &original_save_filename(slot))
+            .unwrap_or_else(|| original_save_path(manager.root(), slot));
+        let deleted = path.is_file() && std::fs::remove_file(&path).is_ok();
+        if deleted {
+            self.save_state.snapshots.remove(&slot);
+            if self.save_state.remembered_slot == slot {
+                self.save_state.remembered_slot = -1;
+            }
+        }
+        log::debug!(
+            "[trace-save] delete_file slot={slot} path={} deleted={deleted}",
+            path.display()
+        );
+        ExtCallOutcome::Value(i32::from(deleted))
     }
 
     fn dispatch_system_button_stub(&mut self, index: u16) -> ExtCallOutcome {
@@ -6911,12 +7255,12 @@ impl ScriptRuntime {
             38 => self.ext_sp_bitblt(sprites),
             39 => self.ext_sp_set_shake(sprites),
             40 => {
-                // sp_paint(): native flushes pending sprite drawing.  The
-                // portable renderer builds the scene every frame, so the exact
-                // side effect is already represented by keeping the render tree
-                // live; this hook exists to keep menu refresh scripts from
-                // falling through the shared fallback path.
-                self.pop_ext_args(0);
+                // Native consumes all six paint arguments. The menu uses this
+                // call to start drawing a fresh set of entries into one slot.
+                let args = self.pop_ext_args(6);
+                if let (Some(&slot), Some(sprites)) = (args.first(), sprites) {
+                    self.clear_save_drawings(sprites, slot);
+                }
                 ExtCallOutcome::Value(1)
             }
             41 => self.ext_sp_set_anim(assets, nls, resource_manager, sprites, task_system),
@@ -9495,6 +9839,7 @@ impl ScriptRuntime {
             }
             return ExtCallOutcome::Value(1);
         };
+        self.clear_save_drawings(sprites, slot);
         if slot == -1 {
             let transitions = self
                 .game_sprite_transitions
@@ -11207,26 +11552,152 @@ impl ScriptRuntime {
 
     fn capture_save_snapshot(&self) -> RuntimeSaveSnapshot {
         RuntimeSaveSnapshot {
+            version: 2,
             pc: self.pc,
             call_stack: self.call_stack.clone(),
-            user_mem: self.user_mem.clone(),
-            system_mem: self.system_mem.clone(),
-            temp_mem: self.temp_mem.clone(),
-            mem_dat_words: self.mem_dat_words.clone(),
+            user_mem: bounded_i32_copy(&self.user_mem, DEFAULT_MEM_SIZE),
+            system_mem: bounded_i32_copy(&self.system_mem, DEFAULT_MEM_SIZE),
+            temp_mem: bounded_i32_copy(&self.temp_mem, DEFAULT_MEM_SIZE),
+            mem_dat_words: bounded_i32_copy(&self.mem_dat_words, SAVE_MEMDAT_CAP),
             history_records: self.history_state.records.clone(),
             text_args: self.text_state.last_text_args,
             text_base: self.text_state.base,
             text_mode: self.text_state.mode,
             text_visible: self.text_state.visible,
+            vars: bounded_i32_copy(&self.vars, DEFAULT_VAR_COUNT),
+            stack: self.stack.clone(),
+            argument_stack: self.argument_stack.clone(),
+            argument_base: self.argument_base,
+            text_initialized: self.text_state.initialized,
+            text_init_args: self.text_state.init_args,
+            text_color: self.text_state.text_color,
+            text_effect_color: self.text_state.text_effect_color,
+            show_wait_mark: self.text_state.show_wait_mark,
+            resume_wait_click: false,
+            title_bytes: self.save_state.title_bytes.clone(),
+            thumb_width: self.save_state.thumbnail_size[0],
+            thumb_height: self.save_state.thumbnail_size[1],
+            thumb_pixels: self.save_state.thumbnail_pixels.clone(),
+            sprites: Vec::new(),
+            buttons: Vec::new(),
+            button_groups: Vec::new(),
         }
+    }
+
+    fn capture_save_checkpoint(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        sprites: Option<&SpriteSystem>,
+    ) {
+        if self.temp_mem.len() > DEFAULT_MEM_SIZE {
+            self.temp_mem.truncate(DEFAULT_MEM_SIZE);
+            self.temp_mem.shrink_to_fit();
+        }
+        if let Some(sprites) = sprites {
+            self.capture_thumbnail(sprites);
+        }
+        let (body, name) = self.adv_text_parts_for_render(assets, nls);
+        let title = if name.is_empty() {
+            body
+        } else if body.is_empty() {
+            name
+        } else {
+            format!("{name} {body}")
+        };
+        let (title, _) = parse_pal_text_directives(&title);
+        if !title.is_empty() {
+            self.save_state.title_bytes = title.into_bytes();
+        }
+        let snapshot = self.capture_resumable_scene(sprites);
+        self.save_state.resume_checkpoint = None;
+        self.save_state.checkpoint = Some(snapshot);
+        self.save_state.armed = true;
+    }
+
+    fn capture_resumable_scene(&self, sprites: Option<&SpriteSystem>) -> RuntimeSaveSnapshot {
+        let mut snapshot = self.capture_save_snapshot();
+        if let Some(sprites) = sprites {
+            snapshot.sprites = self.capture_sprite_records(sprites);
+            snapshot.buttons = self.capture_button_records(sprites);
+            snapshot.button_groups = self
+                .button_groups
+                .iter()
+                .map(|(&group, entry)| SavedButtonGroup {
+                    group,
+                    normal_image: entry.normal_image,
+                    hover_image: entry.hover_image,
+                    onmouse_index: entry.onmouse_index,
+                })
+                .collect();
+        }
+        snapshot
+    }
+
+    fn resumable_save_snapshot(&self) -> Option<RuntimeSaveSnapshot> {
+        self.save_state
+            .resume_checkpoint
+            .clone()
+            .or_else(|| self.save_state.checkpoint.clone())
+    }
+
+    fn capture_sprite_records(&self, sprites: &SpriteSystem) -> Vec<SavedSprite> {
+        let mut records = Vec::new();
+        for (&slot, &handle) in &self.game_sprites {
+            if let Some(record) = saved_sprite_from_handle(sprites, slot, handle) {
+                records.push(record);
+            }
+            if records.len() >= SAVE_SPRITE_CAP {
+                break;
+            }
+        }
+        records
+    }
+
+    fn capture_button_records(&self, sprites: &SpriteSystem) -> Vec<SavedButton> {
+        let mut records = Vec::new();
+        for (&(group, index), entry) in &self.game_buttons {
+            let Some(sprite) = sprites.get(entry.handle) else {
+                continue;
+            };
+            let Some(surface) = sprites.surface(sprite.surface) else {
+                continue;
+            };
+            let texture = surface.to_scene_texture();
+            let expected = texture.width as usize * texture.height as usize * 4;
+            if expected == 0 || expected > SAVE_SPRITE_BYTES_CAP || texture.pixels.len() < expected
+            {
+                continue;
+            }
+            records.push(SavedButton {
+                group,
+                index,
+                visible: entry.visible,
+                enabled: entry.enabled,
+                alpha: entry.alpha,
+                gosub_point: entry.gosub_point.map(|point| point as i32).unwrap_or(-1),
+                x: sprite.position.x as i32,
+                y: sprite.position.y as i32,
+                z: sprite.position.z as i32,
+                priority: sprite.base_priority,
+                width: texture.width,
+                height: texture.height,
+                name: entry.name.chars().take(SAVE_NAME_CAP).collect(),
+                rgba: texture.pixels[..expected].to_vec(),
+            });
+            if records.len() >= SAVE_SPRITE_CAP {
+                break;
+            }
+        }
+        records
     }
 
     fn restore_save_snapshot(&mut self, snapshot: RuntimeSaveSnapshot) {
         self.pc = snapshot.pc;
         self.call_stack = snapshot.call_stack;
-        self.user_mem = snapshot.user_mem;
-        self.system_mem = snapshot.system_mem;
-        self.temp_mem = snapshot.temp_mem;
+        install_i32_words(&mut self.user_mem, &snapshot.user_mem, DEFAULT_MEM_SIZE);
+        install_i32_words(&mut self.system_mem, &snapshot.system_mem, DEFAULT_MEM_SIZE);
+        install_i32_words(&mut self.temp_mem, &snapshot.temp_mem, DEFAULT_MEM_SIZE);
         self.mem_dat_words = snapshot.mem_dat_words;
         self.history_state.records = snapshot.history_records;
         self.text_state.last_text_args = snapshot.text_args;
@@ -11236,7 +11707,161 @@ impl ScriptRuntime {
         self.text_state.visible = snapshot.text_visible;
         self.text_state.reveal_enabled = false;
         self.text_state.dirty = true;
+        if snapshot.version >= 2 {
+            install_i32_words(&mut self.vars, &snapshot.vars, DEFAULT_VAR_COUNT);
+            self.stack = snapshot.stack;
+            self.argument_stack = snapshot.argument_stack;
+            self.argument_base = snapshot.argument_base;
+            self.text_state.initialized = snapshot.text_initialized;
+            self.text_state.init_args = snapshot.text_init_args;
+            self.text_state.text_color = snapshot.text_color;
+            self.text_state.text_effect_color = snapshot.text_effect_color;
+            self.text_state.show_wait_mark = snapshot.show_wait_mark;
+        }
+        // The load script can start a fade before invoking `load`. That fade
+        // belongs to the outgoing scene and must not cover the restored one.
+        self.effect_system.stop_selected(0x1d);
+        self.wait_time_stack.clear();
+        self.adv_wait_checkpoint_pending = false;
         self.status = RuntimeStatus::Running { pc: self.pc };
+    }
+
+    fn restore_checkpoint_scene(
+        &mut self,
+        snapshot: &RuntimeSaveSnapshot,
+        sprites: &mut SpriteSystem,
+    ) {
+        self.release_scene_for_load(sprites);
+        for record in &snapshot.sprites {
+            let Some(handle) = sprites.create_rgba_sprite(
+                record.width,
+                record.height,
+                record.rgba.clone(),
+                PalVec3::from_f32(record.x as f32, record.y as f32, record.z as f32),
+                record.priority,
+                format!("save-sprite:{}", record.slot),
+            ) else {
+                continue;
+            };
+            let _ = sprites.set_scale(handle, f32::from_bits(record.scale_bits));
+            let _ = sprites.set_color(handle, PalColor(record.color));
+            let _ = sprites.view_ctrl(handle, record.visible);
+            let _ = sprites.set_rect(
+                handle,
+                Some(PalRect::new(
+                    record.rect[0],
+                    record.rect[1],
+                    record.rect[2],
+                    record.rect[3],
+                )),
+            );
+            if let Some(sprite) = sprites.get_mut(handle) {
+                sprite.offset = PalPoint2 {
+                    x: record.offset_x,
+                    y: record.offset_y,
+                };
+            }
+            self.game_sprites.insert(record.slot, handle);
+        }
+        self.button_groups.clear();
+        for group in &snapshot.button_groups {
+            self.button_groups.insert(
+                group.group,
+                GameButtonGroup {
+                    normal_image: group.normal_image,
+                    hover_image: group.hover_image,
+                    onmouse_index: group.onmouse_index,
+                },
+            );
+        }
+        for record in &snapshot.buttons {
+            let Some(handle) = sprites.create_rgba_sprite(
+                record.width,
+                record.height,
+                record.rgba.clone(),
+                PalVec3::from_f32(record.x as f32, record.y as f32, record.z as f32),
+                record.priority,
+                format!("save-button:{}:{}", record.group, record.index),
+            ) else {
+                continue;
+            };
+            let _ = sprites.view_ctrl(handle, record.visible);
+            self.game_buttons.insert(
+                (record.group, record.index),
+                GameButtonEntry {
+                    handle,
+                    name: record.name.clone(),
+                    visible: record.visible,
+                    enabled: record.enabled,
+                    locked: false,
+                    toggle: 0,
+                    alpha: record.alpha,
+                    slider_offset: 0,
+                    hit_rect: None,
+                    gosub_point: (record.gosub_point > 0).then_some(record.gosub_point as u32),
+                    anim_resource: None,
+                    anim_play_flag: 0,
+                },
+            );
+        }
+        self.text_state.dirty = true;
+    }
+
+    fn release_scene_for_load(&mut self, sprites: &mut SpriteSystem) {
+        for transition in self.game_sprite_transitions.values().copied() {
+            sprites.release_transition_handle(transition);
+        }
+        self.game_sprite_transitions.clear();
+        for handle in self.game_sprite_transition_sources.values().copied() {
+            sprites.release(handle);
+        }
+        self.game_sprite_transition_sources.clear();
+        for handle in self.game_sprites.values().copied() {
+            sprites.release(handle);
+        }
+        self.game_sprites.clear();
+        self.game_sprite_pending_position.clear();
+        self.game_sprite_active_alpha.clear();
+        self.game_sprite_pending_alpha.clear();
+        self.game_sprite_pending_named_animations.clear();
+        self.game_sprite_animations.clear();
+        self.game_sprite_placements.clear();
+        self.game_sprite_native_scales.clear();
+        self.game_sprite_wrapper_visuals.clear();
+        self.game_sprite_child_lanes.clear();
+        self.game_sprite_anim_params.clear();
+        self.game_sprite_aspect_position_types.clear();
+        self.game_sprite_vis_clip_slots.clear();
+        self.game_face_slots.clear();
+        self.game_sprite_base_alpha.clear();
+        self.game_sprite_final_alpha_delta.clear();
+        for state in self.game_msprites.values() {
+            if let Some(handle) = state.handle {
+                self.msprite_system.release(handle);
+            }
+        }
+        self.game_msprites.clear();
+        self.pending_msp_wait_slot = None;
+        if let Some(handle) = self.backbuffer_sprite.take() {
+            sprites.release(handle);
+        }
+        if let Some(handle) = self.text_state.sprite.take() {
+            sprites.release(handle);
+        }
+        if let Some(handle) = self.text_state.name_sprite.take() {
+            sprites.release(handle);
+        }
+        self.clear_save_drawings(sprites, -1);
+        for entry in self.game_buttons.values() {
+            sprites.release(entry.handle);
+        }
+        self.game_buttons.clear();
+        self.button_push_queue.clear();
+        self.title_modal_buttons = None;
+        self.system_buttons.clear();
+        for retired in self.retired_sprites.drain(..) {
+            sprites.release(retired.handle);
+        }
     }
 
     fn ext_bgm_play(
@@ -13522,6 +14147,23 @@ fn find_loose_save_file(root: &Path, filename: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+fn write_save_lock_dword(path: &Path, value: i32) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)?;
+    if &header == b"SENARSAV" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "portable-only save has no lock dword",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&value.to_le_bytes())
+}
+
 fn portable_save_dir(root: &Path) -> PathBuf {
     root.join("save").join("sena_rs")
 }
@@ -13542,13 +14184,25 @@ fn portable_system_data_path(root: &Path) -> PathBuf {
 fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"SENARSAV");
-    write_u32(&mut bytes, 1)?;
+    write_u32(&mut bytes, 3)?;
     write_u32(&mut bytes, snapshot.pc)?;
     write_u32_vec(&mut bytes, &snapshot.call_stack)?;
-    write_i32_vec(&mut bytes, &snapshot.user_mem)?;
-    write_i32_vec(&mut bytes, &snapshot.system_mem)?;
-    write_i32_vec(&mut bytes, &snapshot.temp_mem)?;
-    write_i32_vec(&mut bytes, &snapshot.mem_dat_words)?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.user_mem, DEFAULT_MEM_SIZE),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.system_mem, DEFAULT_MEM_SIZE),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.temp_mem, DEFAULT_MEM_SIZE),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.mem_dat_words, SAVE_MEMDAT_CAP),
+    )?;
     write_u32(&mut bytes, snapshot.history_records.len() as u32)?;
     for record in &snapshot.history_records {
         for value in record {
@@ -13561,6 +14215,43 @@ fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Resu
     write_i32(&mut bytes, snapshot.text_base)?;
     write_i32(&mut bytes, snapshot.text_mode)?;
     bytes.write_all(&[u8::from(snapshot.text_visible)])?;
+    write_i32(&mut bytes, snapshot.argument_base)?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.vars, DEFAULT_VAR_COUNT),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.stack, DEFAULT_STACK_LIMIT),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.argument_stack, DEFAULT_STACK_LIMIT),
+    )?;
+    bytes.write_all(&[u8::from(snapshot.text_initialized)])?;
+    for value in snapshot.text_init_args {
+        write_i32(&mut bytes, value)?;
+    }
+    write_u32(&mut bytes, snapshot.text_color)?;
+    write_u32(&mut bytes, snapshot.text_effect_color)?;
+    bytes.write_all(&[u8::from(snapshot.show_wait_mark)])?;
+    write_bytes(&mut bytes, &snapshot.title_bytes, SAVE_NAME_CAP)?;
+    write_i32(&mut bytes, snapshot.thumb_width)?;
+    write_i32(&mut bytes, snapshot.thumb_height)?;
+    write_bytes(&mut bytes, &snapshot.thumb_pixels, SAVE_SPRITE_BYTES_CAP)?;
+    write_saved_sprites(&mut bytes, &snapshot.sprites)?;
+    write_saved_buttons(&mut bytes, &snapshot.buttons)?;
+    write_u32(
+        &mut bytes,
+        snapshot.button_groups.len().min(SAVE_SPRITE_CAP) as u32,
+    )?;
+    for group in snapshot.button_groups.iter().take(SAVE_SPRITE_CAP) {
+        write_i32(&mut bytes, group.group)?;
+        write_i32(&mut bytes, group.normal_image)?;
+        write_i32(&mut bytes, group.hover_image)?;
+        write_i32(&mut bytes, group.onmouse_index)?;
+    }
+    bytes.write_all(&[u8::from(snapshot.resume_wait_click)])?;
     Ok(bytes)
 }
 
@@ -13583,7 +14274,17 @@ fn write_runtime_save_snapshot(
 fn read_original_save_prefix(root: &Path, slot: i32) -> std::io::Result<OriginalSavePrefix> {
     let path = find_loose_save_file(root, &original_save_filename(slot))
         .unwrap_or_else(|| original_save_path(root, slot));
-    let bytes = std::fs::read(path)?;
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; HEADER_BEFORE_PIXELS];
+    file.read_exact(&mut header)?;
+    let prefix_len = original_prefix_len(&header).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save")
+    })?;
+    let mut bytes = vec![0_u8; prefix_len];
+    bytes[..HEADER_BEFORE_PIXELS].copy_from_slice(&header);
+    if prefix_len > HEADER_BEFORE_PIXELS {
+        file.read_exact(&mut bytes[HEADER_BEFORE_PIXELS..])?;
+    }
     decode_original_save(&bytes)
         .map(|(prefix, _)| prefix)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save"))
@@ -13593,17 +14294,13 @@ fn read_runtime_save_snapshot(root: &Path, slot: i32) -> std::io::Result<Runtime
     let original = find_loose_save_file(root, &original_save_filename(slot))
         .unwrap_or_else(|| original_save_path(root, slot));
     if original.is_file() {
-        let bytes = std::fs::read(&original)?;
-        if let Some((_, Some(trailer))) = decode_original_save(&bytes) {
-            return decode_runtime_save_snapshot(trailer);
-        }
-        if bytes.starts_with(b"SENARSAV") {
-            return decode_runtime_save_snapshot(&bytes);
+        if let Ok(snapshot) = read_snapshot_file(&original) {
+            return Ok(snapshot);
         }
     }
     let legacy = portable_save_path(root, slot);
     if legacy.is_file() {
-        return decode_runtime_save_snapshot(&std::fs::read(legacy)?);
+        return read_snapshot_file(&legacy);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -13611,47 +14308,71 @@ fn read_runtime_save_snapshot(root: &Path, slot: i32) -> std::io::Result<Runtime
     ))
 }
 
-fn decode_runtime_save_snapshot(bytes: &[u8]) -> std::io::Result<RuntimeSaveSnapshot> {
-    let mut cursor = Cursor::new(bytes);
+fn read_snapshot_file(path: &Path) -> std::io::Result<RuntimeSaveSnapshot> {
+    let mut file = File::open(path)?;
     let mut magic = [0_u8; 8];
-    cursor.read_exact(&mut magic)?;
+    file.read_exact(&mut magic)?;
+    if &magic == b"SENARSAV" {
+        file.seek(SeekFrom::Start(0))?;
+        return decode_runtime_save_snapshot(&mut file);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; HEADER_BEFORE_PIXELS];
+    file.read_exact(&mut header)?;
+    let prefix_len = original_prefix_len(&header).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save")
+    })? as u64;
+    file.seek(SeekFrom::Start(prefix_len))?;
+    decode_runtime_save_snapshot(&mut file)
+}
+
+fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<RuntimeSaveSnapshot> {
+    let mut magic = [0_u8; 8];
+    reader.read_exact(&mut magic)?;
     if &magic != b"SENARSAV" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad portable save magic",
         ));
     }
-    let version = read_u32(&mut cursor)?;
-    if version != 1 {
+    let version = read_u32_from(reader)?;
+    if !(1..=3).contains(&version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported portable save version",
         ));
     }
-    let pc = read_u32(&mut cursor)?;
-    let call_stack = read_u32_vec(&mut cursor)?;
-    let user_mem = read_i32_vec(&mut cursor)?;
-    let system_mem = read_i32_vec(&mut cursor)?;
-    let temp_mem = read_i32_vec(&mut cursor)?;
-    let mem_dat_words = read_i32_vec(&mut cursor)?;
-    let history_len = read_u32(&mut cursor)? as usize;
+    let pc = read_u32_from(reader)?;
+    let call_stack = read_u32_vec_capped(reader, DEFAULT_STACK_LIMIT)?;
+    let user_mem = read_i32_vec_capped(reader, DEFAULT_MEM_SIZE)?;
+    let system_mem = read_i32_vec_capped(reader, DEFAULT_MEM_SIZE)?;
+    let temp_mem = read_i32_vec_capped(reader, DEFAULT_MEM_SIZE)?;
+    let mem_dat_words = read_i32_vec_capped(reader, SAVE_MEMDAT_CAP)?;
+    let history_len = read_u32_from(reader)? as usize;
+    if history_len > 10_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save history is too large",
+        ));
+    }
     let mut history_records = Vec::with_capacity(history_len);
     for _ in 0..history_len {
         let mut record = [0_i32; 9];
         for value in &mut record {
-            *value = read_i32(&mut cursor)?;
+            *value = read_i32_from(reader)?;
         }
         history_records.push(record);
     }
     let mut text_args = [0_i32; 4];
     for value in &mut text_args {
-        *value = read_i32(&mut cursor)?;
+        *value = read_i32_from(reader)?;
     }
-    let text_base = read_i32(&mut cursor)?;
-    let text_mode = read_i32(&mut cursor)?;
+    let text_base = read_i32_from(reader)?;
+    let text_mode = read_i32_from(reader)?;
     let mut visible = [0_u8; 1];
-    cursor.read_exact(&mut visible)?;
-    Ok(RuntimeSaveSnapshot {
+    reader.read_exact(&mut visible)?;
+    let mut snapshot = RuntimeSaveSnapshot {
+        version,
         pc,
         call_stack,
         user_mem,
@@ -13663,7 +14384,50 @@ fn decode_runtime_save_snapshot(bytes: &[u8]) -> std::io::Result<RuntimeSaveSnap
         text_base,
         text_mode,
         text_visible: visible[0] != 0,
-    })
+        ..RuntimeSaveSnapshot::default()
+    };
+    if version >= 2 {
+        snapshot.argument_base = read_i32_from(reader)?;
+        snapshot.vars = read_i32_vec_capped(reader, DEFAULT_VAR_COUNT)?;
+        snapshot.stack = read_i32_vec_capped(reader, DEFAULT_STACK_LIMIT)?;
+        snapshot.argument_stack = read_i32_vec_capped(reader, DEFAULT_STACK_LIMIT)?;
+        let mut flag = [0_u8; 1];
+        reader.read_exact(&mut flag)?;
+        snapshot.text_initialized = flag[0] != 0;
+        for value in &mut snapshot.text_init_args {
+            *value = read_i32_from(reader)?;
+        }
+        snapshot.text_color = read_u32_from(reader)?;
+        snapshot.text_effect_color = read_u32_from(reader)?;
+        reader.read_exact(&mut flag)?;
+        snapshot.show_wait_mark = flag[0] != 0;
+        snapshot.title_bytes = read_bytes_capped(reader, SAVE_NAME_CAP)?;
+        snapshot.thumb_width = read_i32_from(reader)?;
+        snapshot.thumb_height = read_i32_from(reader)?;
+        snapshot.thumb_pixels = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
+        snapshot.sprites = read_saved_sprites(reader)?;
+        snapshot.buttons = read_saved_buttons(reader)?;
+        let group_len = read_u32_from(reader)? as usize;
+        if group_len > SAVE_SPRITE_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "save button groups are too large",
+            ));
+        }
+        for _ in 0..group_len {
+            snapshot.button_groups.push(SavedButtonGroup {
+                group: read_i32_from(reader)?,
+                normal_image: read_i32_from(reader)?,
+                hover_image: read_i32_from(reader)?,
+                onmouse_index: read_i32_from(reader)?,
+            });
+        }
+        if version >= 3 {
+            reader.read_exact(&mut flag)?;
+            snapshot.resume_wait_click = flag[0] != 0;
+        }
+    }
+    Ok(snapshot)
 }
 
 fn write_i32(out: &mut Vec<u8>, value: i32) -> std::io::Result<()> {
@@ -13690,51 +14454,422 @@ fn write_u32_vec(out: &mut Vec<u8>, values: &[u32]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_i32(cursor: &mut Cursor<&[u8]>) -> std::io::Result<i32> {
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8], cap: usize) -> std::io::Result<()> {
+    let bytes = if bytes.len() > cap {
+        &bytes[..cap]
+    } else {
+        bytes
+    };
+    write_u32(out, bytes.len() as u32)?;
+    out.write_all(bytes)
+}
+
+fn write_saved_sprites(out: &mut Vec<u8>, sprites: &[SavedSprite]) -> std::io::Result<()> {
+    let sprites = sprites
+        .iter()
+        .filter(|sprite| sprite.rgba.len() <= SAVE_SPRITE_BYTES_CAP)
+        .take(SAVE_SPRITE_CAP);
+    let sprites: Vec<&SavedSprite> = sprites.collect();
+    write_u32(out, sprites.len() as u32)?;
+    for sprite in sprites {
+        write_i32(out, sprite.slot)?;
+        write_i32(out, sprite.x)?;
+        write_i32(out, sprite.y)?;
+        write_i32(out, sprite.z)?;
+        write_i32(out, sprite.offset_x)?;
+        write_i32(out, sprite.offset_y)?;
+        write_i32(out, sprite.priority)?;
+        write_u32(out, sprite.scale_bits)?;
+        write_u32(out, sprite.color)?;
+        out.write_all(&[u8::from(sprite.visible)])?;
+        for value in sprite.rect {
+            write_i32(out, value)?;
+        }
+        write_u32(out, sprite.width)?;
+        write_u32(out, sprite.height)?;
+        write_bytes(out, &sprite.rgba, SAVE_SPRITE_BYTES_CAP)?;
+    }
+    Ok(())
+}
+
+fn write_saved_buttons(out: &mut Vec<u8>, buttons: &[SavedButton]) -> std::io::Result<()> {
+    let buttons: Vec<&SavedButton> = buttons
+        .iter()
+        .filter(|button| button.rgba.len() <= SAVE_SPRITE_BYTES_CAP)
+        .take(SAVE_SPRITE_CAP)
+        .collect();
+    write_u32(out, buttons.len() as u32)?;
+    for button in buttons {
+        write_i32(out, button.group)?;
+        write_i32(out, button.index)?;
+        out.write_all(&[u8::from(button.visible), button.enabled as u8, button.alpha])?;
+        write_i32(out, button.gosub_point)?;
+        write_i32(out, button.x)?;
+        write_i32(out, button.y)?;
+        write_i32(out, button.z)?;
+        write_i32(out, button.priority)?;
+        write_u32(out, button.width)?;
+        write_u32(out, button.height)?;
+        write_bytes(out, button.name.as_bytes(), SAVE_NAME_CAP)?;
+        write_bytes(out, &button.rgba, SAVE_SPRITE_BYTES_CAP)?;
+    }
+    Ok(())
+}
+
+fn read_i32_from(reader: &mut impl Read) -> std::io::Result<i32> {
     let mut bytes = [0_u8; 4];
-    cursor.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes)?;
     Ok(i32::from_le_bytes(bytes))
 }
 
-fn read_u32(cursor: &mut Cursor<&[u8]>) -> std::io::Result<u32> {
+fn read_u32_from(reader: &mut impl Read) -> std::io::Result<u32> {
     let mut bytes = [0_u8; 4];
-    cursor.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_i32_vec(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Vec<i32>> {
-    let len = read_u32(cursor)? as usize;
+fn read_i32_vec_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<i32>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save vector is too large",
+        ));
+    }
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
-        values.push(read_i32(cursor)?);
+        values.push(read_i32_from(reader)?);
     }
     Ok(values)
 }
 
-fn read_u32_vec(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Vec<u32>> {
-    let len = read_u32(cursor)? as usize;
+fn read_u32_vec_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<u32>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save vector is too large",
+        ));
+    }
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
-        values.push(read_u32(cursor)?);
+        values.push(read_u32_from(reader)?);
     }
     Ok(values)
+}
+
+fn read_bytes_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save blob is too large",
+        ));
+    }
+    let mut bytes = vec![0_u8; len];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_saved_sprites(reader: &mut impl Read) -> std::io::Result<Vec<SavedSprite>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > SAVE_SPRITE_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save sprites are too large",
+        ));
+    }
+    let mut sprites = Vec::with_capacity(len);
+    for _ in 0..len {
+        let slot = read_i32_from(reader)?;
+        let x = read_i32_from(reader)?;
+        let y = read_i32_from(reader)?;
+        let z = read_i32_from(reader)?;
+        let offset_x = read_i32_from(reader)?;
+        let offset_y = read_i32_from(reader)?;
+        let priority = read_i32_from(reader)?;
+        let scale_bits = read_u32_from(reader)?;
+        let color = read_u32_from(reader)?;
+        let mut flags = [0_u8; 1];
+        reader.read_exact(&mut flags)?;
+        let mut rect = [0_i32; 4];
+        for value in &mut rect {
+            *value = read_i32_from(reader)?;
+        }
+        let width = read_u32_from(reader)?;
+        let height = read_u32_from(reader)?;
+        let rgba = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
+        sprites.push(SavedSprite {
+            slot,
+            x,
+            y,
+            z,
+            offset_x,
+            offset_y,
+            priority,
+            scale_bits,
+            color,
+            visible: flags[0] != 0,
+            rect,
+            width,
+            height,
+            rgba,
+        });
+    }
+    Ok(sprites)
+}
+
+fn read_saved_buttons(reader: &mut impl Read) -> std::io::Result<Vec<SavedButton>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > SAVE_SPRITE_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save buttons are too large",
+        ));
+    }
+    let mut buttons = Vec::with_capacity(len);
+    for _ in 0..len {
+        let group = read_i32_from(reader)?;
+        let index = read_i32_from(reader)?;
+        let mut flags = [0_u8; 3];
+        reader.read_exact(&mut flags)?;
+        let gosub_point = read_i32_from(reader)?;
+        let x = read_i32_from(reader)?;
+        let y = read_i32_from(reader)?;
+        let z = read_i32_from(reader)?;
+        let priority = read_i32_from(reader)?;
+        let width = read_u32_from(reader)?;
+        let height = read_u32_from(reader)?;
+        let name = String::from_utf8_lossy(&read_bytes_capped(reader, SAVE_NAME_CAP)?).into_owned();
+        let rgba = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
+        buttons.push(SavedButton {
+            group,
+            index,
+            visible: flags[0] != 0,
+            enabled: flags[1] != 0,
+            alpha: flags[2],
+            gosub_point,
+            x,
+            y,
+            z,
+            priority,
+            width,
+            height,
+            name,
+            rgba,
+        });
+    }
+    Ok(buttons)
+}
+
+fn bounded_i32_copy(values: &[i32], cap: usize) -> Vec<i32> {
+    values.iter().take(cap).copied().collect()
+}
+
+fn install_i32_words(dst: &mut Vec<i32>, src: &[i32], min_len: usize) {
+    if dst.len() < min_len {
+        dst.resize(min_len, 0);
+    }
+    for slot in dst.iter_mut() {
+        *slot = 0;
+    }
+    for (index, value) in src.iter().enumerate().take(dst.len()) {
+        dst[index] = *value;
+    }
+}
+
+fn saved_sprite_from_handle(
+    sprites: &SpriteSystem,
+    slot: i32,
+    handle: SpriteHandle,
+) -> Option<SavedSprite> {
+    let sprite = sprites.get(handle)?;
+    let surface = sprites.surface(sprite.surface)?;
+    let texture = surface.to_scene_texture();
+    let expected = texture.width as usize * texture.height as usize * 4;
+    if expected == 0 || expected > SAVE_SPRITE_BYTES_CAP || texture.pixels.len() < expected {
+        return None;
+    }
+    Some(SavedSprite {
+        slot,
+        x: sprite.position.x as i32,
+        y: sprite.position.y as i32,
+        z: sprite.position.z as i32,
+        offset_x: sprite.offset.x,
+        offset_y: sprite.offset.y,
+        priority: sprite.base_priority,
+        scale_bits: sprite.scale.to_bits(),
+        color: sprite.color.0,
+        visible: sprite.visible,
+        rect: [
+            sprite.source_rect.left,
+            sprite.source_rect.top,
+            sprite.source_rect.right,
+            sprite.source_rect.bottom,
+        ],
+        width: texture.width,
+        height: texture.height,
+        rgba: texture.pixels[..expected].to_vec(),
+    })
+}
+
+fn save_file_modified(resource_manager: Option<&ResourceManager>, slot: i32) -> Option<SystemTime> {
+    let manager = resource_manager?;
+    let path = find_loose_save_file(manager.root(), &original_save_filename(slot))?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn decode_save_title(bytes: &[u8], nls: Nls) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let bytes = &bytes[..end];
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    nls.decode(bytes)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+}
+
+struct LocalDateTime {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    weekday: u32,
+}
+
+fn local_date_time(time: SystemTime) -> LocalDateTime {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    #[cfg(unix)]
+    if let Some(local) = unix_local_date_time(secs) {
+        return local;
+    }
+    utc_date_time(secs)
+}
+
+fn utc_date_time(secs: i64) -> LocalDateTime {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400) as u32;
+    let weekday = (days + 4).rem_euclid(7) as u32;
+    let mut year = 1970_i32;
+    let mut day = days;
+    loop {
+        let year_days = if is_leap(year) { 366 } else { 365 };
+        if day < year_days {
+            break;
+        }
+        day -= year_days;
+        year += 1;
+    }
+    let months = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1_u32;
+    for days_in_month in months {
+        if day < days_in_month {
+            break;
+        }
+        day -= days_in_month;
+        month += 1;
+    }
+    LocalDateTime {
+        year,
+        month,
+        day: day as u32 + 1,
+        hour: tod / 3_600,
+        minute: (tod / 60) % 60,
+        second: tod % 60,
+        weekday,
+    }
+}
+
+fn is_leap(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+#[cfg(unix)]
+fn unix_local_date_time(secs: i64) -> Option<LocalDateTime> {
+    #[repr(C)]
+    struct LibcTm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        tm_gmtoff: i64,
+        tm_zone: *const i8,
+    }
+    extern "C" {
+        fn localtime_r(timer: *const i64, result: *mut LibcTm) -> *mut LibcTm;
+    }
+    unsafe {
+        let mut tm = std::mem::zeroed::<LibcTm>();
+        if localtime_r(&secs, &mut tm).is_null() {
+            return None;
+        }
+        Some(LocalDateTime {
+            year: tm.tm_year + 1900,
+            month: tm.tm_mon as u32 + 1,
+            day: tm.tm_mday as u32,
+            hour: tm.tm_hour as u32,
+            minute: tm.tm_min as u32,
+            second: tm.tm_sec as u32,
+            weekday: tm.tm_wday as u32,
+        })
+    }
 }
 
 fn format_save_time(modified: SystemTime, format_mode: i32) -> String {
-    let seconds = modified
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-        % 86_400;
-    let hour = seconds / 3_600;
-    let minute = (seconds / 60) % 60;
-    let second = seconds % 60;
+    let local = local_date_time(modified);
+    let hour = local.hour;
+    let minute = local.minute;
+    let second = local.second;
     match format_mode {
         1 => format!("{hour:02}{minute:02}{second:02}"),
         2 => format!("{hour:02}:{minute:02}"),
         3 => format!("{hour:02}{minute:02}"),
         _ => format!("{hour:02}:{minute:02}:{second:02}"),
     }
+}
+
+fn format_save_day(modified: SystemTime, format_mode: i32) -> String {
+    let local = local_date_time(modified);
+    let date = format!(
+        "{:02}/{:02}/{:02}",
+        local.year.rem_euclid(100),
+        local.month,
+        local.day
+    );
+    if format_mode == 0 {
+        return date;
+    }
+    let week = ["日", "月", "火", "水", "木", "金", "土"][local.weekday as usize % 7];
+    format!("{date} ({week})")
 }
 
 fn parse_pal_text_directives(text: &str) -> (String, Option<u16>) {
@@ -14727,6 +15862,11 @@ mod tests {
             text_base: 16,
             text_mode: 17,
             text_visible: true,
+            resume_wait_click: true,
+            vars: vec![21, 22],
+            argument_base: 64,
+            title_bytes: b"line".to_vec(),
+            ..RuntimeSaveSnapshot::default()
         };
 
         let path =
@@ -14746,7 +15886,287 @@ mod tests {
         assert_eq!(restored.text_base, snapshot.text_base);
         assert_eq!(restored.text_mode, snapshot.text_mode);
         assert_eq!(restored.text_visible, snapshot.text_visible);
+        assert_eq!(restored.vars, snapshot.vars);
+        assert_eq!(restored.argument_base, 64);
+        assert_eq!(restored.title_bytes, b"line");
+        assert_eq!(restored.version, 3);
+        assert!(restored.resume_wait_click);
+
+        let mut older_bytes = encode_runtime_save_snapshot(&snapshot).expect("encode v3");
+        older_bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        older_bytes.pop();
+        let older = decode_runtime_save_snapshot(&mut older_bytes.as_slice()).expect("read v2");
+        assert_eq!(older.version, 2);
+        assert!(!older.resume_wait_click);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_snapshot_serialization_preserves_the_selected_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_savepoint_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.pc = 0x5AB34;
+        runtime.vars[3] = 42;
+        runtime.save_state.armed = true;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.pc = 0x51F8C;
+        runtime.vars[3] = 99;
+        let checkpoint = runtime.save_state.checkpoint.clone().expect("checkpoint");
+        runtime
+            .write_original_save(&root, 4, &checkpoint, Nls::ShiftJis)
+            .expect("checkpoint save");
+        let restored = read_runtime_save_snapshot(&root, 4).expect("read checkpoint");
+        assert_eq!(restored.pc, 0x5AB34);
+        assert_eq!(restored.vars[3], 42);
+        assert!(restored.temp_mem.len() <= DEFAULT_MEM_SIZE);
+        runtime.restore_save_snapshot(restored);
+        assert_eq!(runtime.pc, 0x5AB34);
+        assert_eq!(runtime.vars[3], 42);
+        assert_ne!(runtime.vars[3], 99);
+
+        let mut huge = b"SENARSAV".to_vec();
+        huge.extend_from_slice(&2_u32.to_le_bytes());
+        huge.extend_from_slice(&0x1000_u32.to_le_bytes());
+        huge.extend_from_slice(&0_u32.to_le_bytes());
+        huge.extend_from_slice(&0_u32.to_le_bytes());
+        huge.extend_from_slice(&0_u32.to_le_bytes());
+        huge.extend_from_slice(&0x1000_0000_u32.to_le_bytes());
+        let err = decode_runtime_save_snapshot(&mut huge.as_slice());
+        assert!(err.is_err(), "oversized temp_mem must not be allocated");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_page_keeps_all_slot_thumbnails_and_clears_them_on_refresh() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_save_page_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("save")).expect("save dir");
+        for slot in 0..2 {
+            let prefix = OriginalSavePrefix {
+                lock: 0,
+                title: Nls::ShiftJis
+                    .encode(&format!("保存{slot}"))
+                    .expect("SJIS title"),
+                mosaic: 0,
+                thumb_width: 2,
+                thumb_height: 2,
+                pixels: vec![slot as u8 + 1; 16],
+            };
+            std::fs::write(
+                original_save_path(&root, slot),
+                encode_original_save(&prefix, &[]),
+            )
+            .expect("save fixture");
+        }
+        let mut manager = ResourceManager::new(&root, Nls::ShiftJis);
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        for (slot, x) in [(0, 10), (1, 200)] {
+            runtime.stack.extend_from_slice(&[20, x, slot, 77]);
+            assert!(matches!(
+                runtime.ext_thumbnail_set(Some(&mut manager), Some(&mut sprites)),
+                ExtCallOutcome::Value(1)
+            ));
+        }
+        assert_eq!(runtime.save_state.thumbnail_sprites.len(), 2);
+        assert!(runtime
+            .save_state
+            .thumbnail_sprites
+            .values()
+            .all(|handle| sprites.get(*handle).is_some_and(|sprite| sprite.draw_command(&sprites).is_some())));
+        runtime.stack.extend_from_slice(&[60, 200, 1, 77]);
+        runtime.ext_save_text_draw(Some(&mut manager), Some(&mut sprites));
+        assert_eq!(runtime.save_state.text_sprites.len(), 1);
+        let text_handle = *runtime.save_state.text_sprites.values().next().unwrap();
+        let text_sprite = sprites.get(text_handle).unwrap();
+        assert!(text_sprite.source_name.contains("保存1"));
+        assert!(text_sprite.draw_command(&sprites).is_some());
+        assert!(sprites
+            .surface(text_sprite.surface)
+            .unwrap()
+            .to_scene_texture()
+            .pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] != 0));
+        let handles = runtime
+            .save_state
+            .thumbnail_sprites
+            .values()
+            .chain(runtime.save_state.text_sprites.values())
+            .copied()
+            .collect::<Vec<_>>();
+        runtime.clear_save_drawings(&mut sprites, 77);
+        assert!(runtime.save_state.thumbnail_sprites.is_empty());
+        assert!(runtime.save_state.text_sprites.is_empty());
+        assert!(handles
+            .into_iter()
+            .all(|handle| sprites.get(handle).is_none()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_prefers_the_last_adv_wait_over_the_menu_pc() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.pc = 0x5AB34;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.pc = 0x31634;
+        runtime.save_state.resume_checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.pc = 0x51F8C;
+        assert_eq!(runtime.resumable_save_snapshot().unwrap().pc, 0x31634);
+    }
+
+    #[test]
+    fn only_adv_wait_click_marks_a_resumable_scene() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.text_state.visible = true;
+        runtime.text_state.last_text_value = 42;
+        runtime.stack.push(-1);
+        assert!(matches!(
+            runtime.dispatch_wait_ext(1),
+            ExtCallOutcome::Wait {
+                request: WaitRequest::Click,
+                ..
+            }
+        ));
+        assert!(std::mem::take(&mut runtime.adv_wait_checkpoint_pending));
+        runtime.stack.push(500);
+        assert!(matches!(
+            runtime.dispatch_wait_ext(1),
+            ExtCallOutcome::Wait {
+                request: WaitRequest::ClickOrTime(500),
+                ..
+            }
+        ));
+        assert!(!runtime.adv_wait_checkpoint_pending);
+    }
+
+    #[test]
+    fn save_title_accepts_native_nls_and_older_utf8_headers() {
+        let title = "昔から、無口な子供だった。";
+        let encoded = Nls::ShiftJis.encode(title).expect("native title");
+        assert_eq!(decode_save_title(&encoded, Nls::ShiftJis), title);
+        assert_eq!(decode_save_title(title.as_bytes(), Nls::ShiftJis), title);
+    }
+
+    #[test]
+    fn loading_pre_menu_scene_releases_menu_sprites() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let background = sprites
+            .create_rgba_sprite(2, 2, vec![255; 16], PalVec3::new(0, 0, 0), 1, "scene")
+            .unwrap();
+        runtime.game_sprites.insert(1, background);
+        runtime.pc = 0x1234;
+        let snapshot = runtime.capture_resumable_scene(Some(&sprites));
+        let menu = sprites
+            .create_rgba_sprite(2, 2, vec![128; 16], PalVec3::new(0, 0, 0), 77, "menu")
+            .unwrap();
+        runtime.game_sprites.insert(77, menu);
+        let thumbnail = sprites
+            .create_rgba_sprite(2, 2, vec![64; 16], PalVec3::new(20, 20, 0), 77, "thumbnail")
+            .unwrap();
+        runtime
+            .save_state
+            .thumbnail_sprites
+            .insert((77, 20, 20), thumbnail);
+        let transition = sprites.create_transition_handle();
+        runtime.game_sprite_transitions.insert(77, transition);
+        assert_eq!(runtime.effect_system.effect(1, 10_000, 0), 1);
+        runtime.restore_save_snapshot(snapshot.clone());
+        runtime.restore_checkpoint_scene(&snapshot, &mut sprites);
+        assert_eq!(runtime.pc, 0x1234);
+        assert_eq!(runtime.game_sprites.len(), 1);
+        assert!(runtime.game_sprites.contains_key(&1));
+        assert!(sprites.get(menu).is_none());
+        assert!(sprites.get(thumbnail).is_none());
+        assert!(runtime.save_state.thumbnail_sprites.is_empty());
+        assert!(!runtime.effect_system.active());
+        assert!(runtime.game_sprite_transitions.is_empty());
+    }
+
+    #[test]
+    fn native_save_fixture_draws_title_and_thumbnail_when_available() {
+        let Some(root) = std::env::var_os("KOIKAKE_ORIGINAL_SAVE_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut manager = ResourceManager::new(&root, Nls::ShiftJis);
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let new_prefix = read_original_save_prefix(&root, 5).expect("second native save");
+        let old_prefix = read_original_save_prefix(&root, 10).expect("first native save");
+        assert_eq!(
+            decode_save_title(&new_prefix.title, Nls::ShiftJis),
+            "世間に興味が無かったからとかじゃない。"
+        );
+        assert_eq!(
+            decode_save_title(&old_prefix.title, Nls::ShiftJis),
+            "昔から、無口な子供だった。"
+        );
+        assert_ne!(new_prefix.pixels, old_prefix.pixels);
+        runtime.stack.extend_from_slice(&[20, 10, 5, 77]);
+        assert!(matches!(
+            runtime.ext_thumbnail_set(Some(&mut manager), Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        runtime.stack.extend_from_slice(&[100, 200, 5, 77]);
+        assert!(matches!(
+            runtime.ext_save_text_draw(Some(&mut manager), Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.save_state.thumbnail_sprites.len(), 1);
+        assert_eq!(runtime.save_state.text_sprites.len(), 1);
+        let thumb_handle = *runtime
+            .save_state
+            .thumbnail_sprites
+            .values()
+            .next()
+            .unwrap();
+        let thumb_sprite = sprites.get(thumb_handle).unwrap();
+        let thumb_pixels = &sprites
+            .surface(thumb_sprite.surface)
+            .unwrap()
+            .to_scene_texture()
+            .pixels;
+        assert!(thumb_pixels.iter().any(|&value| value != 0));
+        let text_handle = *runtime.save_state.text_sprites.values().next().unwrap();
+        assert!(sprites
+            .get(text_handle)
+            .unwrap()
+            .draw_command(&sprites)
+            .is_some());
+        assert!(read_runtime_save_snapshot(&root, 5).is_err());
+        assert!(read_runtime_save_snapshot(&root, 10).is_err());
+
+        let original = std::fs::read(original_save_path(&root, 10)).expect("native save");
+        let copy = std::env::temp_dir().join(format!(
+            "sena_rs_native_lock_{}_{}.dat",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&copy, &original).expect("copy fixture");
+        write_save_lock_dword(&copy, 1).expect("patch copied lock");
+        let patched = std::fs::read(&copy).expect("patched fixture");
+        assert_eq!(&patched[..4], &1_i32.to_le_bytes());
+        assert_eq!(&patched[4..], &original[4..]);
+        let _ = std::fs::remove_file(copy);
     }
 }

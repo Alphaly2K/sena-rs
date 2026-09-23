@@ -1,10 +1,10 @@
-//! Original PAL `save/saveNNN.dat` header used by thumbnail, mosaic, and lock.
+//! Shared Koikake save header used by thumbnail, title, mosaic, and lock.
 //!
-//! Koikake's save capture (`sub_424EA0` / `sub_424AF0`) writes a fixed prefix
-//! before the VM image. `thumbnail_set` seeks to `0x214` for width, height, and
-//! pixel length, then reads RGBA at `0x224`. `save_lock` / `is_save_lock`
-//! read and write the first dword. Mosaic capture (`PalThumbnailCreateMosaic`)
-//! downsamples by a factor of 6 and scales back up.
+//! In the observed 128x72 saves, the native image continues after the pixels
+//! with fixed blocks through `0x13338` and a variable-length subsystem section.
+//! This module only models the common header. `SENARSAV` immediately after the
+//! pixels is a portable sena-rs extension, not a native image. `thumbnail_set` reads RGBA at
+//! `0x224`; `save_lock` reads and writes the first dword.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,8 @@ pub const DEFAULT_THUMB_WIDTH: i32 = 0x80;
 pub const DEFAULT_THUMB_HEIGHT: i32 = 0x48;
 /// `load_thumbnail` uses this sentinel to enable screen capture.
 pub const LOAD_THUMBNAIL_CAPTURE_SENTINEL: i32 = 0x0FFF_FFFF;
+/// Thumbnail RGBA larger than this is rejected instead of being read into memory.
+pub const MAX_THUMB_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_MAGIC: &[u8] = b"SENARSAV";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +87,29 @@ pub fn encode_original_save(prefix: &OriginalSavePrefix, snapshot: &[u8]) -> Vec
     out
 }
 
+/// Byte length of the header plus thumbnail, from the first `0x224` bytes.
+///
+/// Callers use this to read a prefix without mapping the VM trailer. A 1 GiB
+/// trailer must not be pulled in just to draw a save-slot thumbnail.
+pub fn original_prefix_len(header: &[u8]) -> Option<usize> {
+    if header.len() < HEADER_BEFORE_PIXELS || header.starts_with(SNAPSHOT_MAGIC) {
+        return None;
+    }
+    let width = read_i32(header, THUMB_WIDTH_OFFSET)?;
+    let height = read_i32(header, THUMB_HEIGHT_OFFSET)?;
+    let pixel_len = read_i32(header, THUMB_BYTES_OFFSET)?.max(0) as usize;
+    if width < 0 || height < 0 || pixel_len > MAX_THUMB_BYTES {
+        return None;
+    }
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if pixel_len != expected && pixel_len != 0 {
+        return None;
+    }
+    HEADER_BEFORE_PIXELS.checked_add(pixel_len)
+}
+
 pub fn decode_original_save(bytes: &[u8]) -> Option<(OriginalSavePrefix, Option<&[u8]>)> {
     if bytes.starts_with(SNAPSHOT_MAGIC) || bytes.len() < HEADER_BEFORE_PIXELS {
         return None;
@@ -124,14 +149,6 @@ pub fn read_lock_dword(bytes: &[u8]) -> i32 {
         return 0;
     }
     read_i32(bytes, 0).unwrap_or(0)
-}
-
-pub fn patch_lock_dword(bytes: &mut [u8], lock: i32) -> bool {
-    if bytes.starts_with(SNAPSHOT_MAGIC) || bytes.len() < 4 {
-        return false;
-    }
-    bytes[..4].copy_from_slice(&lock.to_le_bytes());
-    true
 }
 
 /// Point-sample downsample by `factor`, then replicate each sample back to the
@@ -259,6 +276,10 @@ mod tests {
         assert_eq!(decoded.mosaic, 1);
         assert_eq!(decoded.pixels, pixels);
         assert_eq!(trailer, Some(snapshot.as_slice()));
+        assert_eq!(
+            original_prefix_len(&bytes[..HEADER_BEFORE_PIXELS]),
+            Some(HEADER_BEFORE_PIXELS + pixels.len())
+        );
     }
 
     #[test]
