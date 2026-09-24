@@ -146,10 +146,12 @@ fn game_sprite_priority(slot: i32) -> i32 {
     slot_order
 }
 
+const BUTTON_RENDER_PRIORITY: i32 = 100;
+
 // Save-slot button surfaces use priority 100. `thumbnail_set` and the save
 // text draw calls paint onto their shared canvas in PAL; when represented as
 // separate sprites they must sit above those translucent button surfaces.
-const SAVE_DRAWING_PRIORITY: i32 = 101;
+const SAVE_DRAWING_PRIORITY: i32 = BUTTON_RENDER_PRIORITY + 1;
 
 #[derive(Clone, Debug)]
 pub enum FrameEvent {
@@ -1829,8 +1831,12 @@ impl ScriptRuntime {
                 self.text_state.init_name_y()
             } else {
                 y.saturating_sub(name_surface_height as i32 + 8)
-            };
-            let name_z = z + 1;
+            }
+            .saturating_add(text_leading as i32);
+            // The native name text is painted over the nameplate/VOICE button
+            // surface. That button lives on the button render lane, so z+1
+            // would leave the name underneath its own background.
+            let name_z = BUTTON_RENDER_PRIORITY + 1;
             if let Some(handle) = self.text_state.name_sprite {
                 let _ = sprites.replace_sprite_surface(
                     handle,
@@ -4274,7 +4280,10 @@ impl ScriptRuntime {
             19 => {
                 let args = self.pop_ext_args(2);
                 if args.len() >= 2 {
-                    self.font_state.set_color(args[0] as u32, args[1] as u32);
+                    self.font_state.set_color(
+                        opaque_pal_font_color(args[0] as u32),
+                        opaque_pal_font_color(args[1] as u32),
+                    );
                 }
                 ExtCallOutcome::Value(1)
             }
@@ -4434,6 +4443,9 @@ impl ScriptRuntime {
                 self.text_state.mode = ordered[0];
                 self.text_state.init_args = ordered;
                 self.font_state.set_font_size(ordered[7].max(1) as u16);
+                let (text_color, effect_color) = self.font_state.color();
+                self.text_state.text_color = text_color;
+                self.text_state.text_effect_color = effect_color;
                 self.text_state.last_event_time_ms = self.pal_time_ms;
                 self.text_state.dirty = true;
                 log::debug!("[trace-text] text_init args={ordered:?}");
@@ -4701,8 +4713,8 @@ impl ScriptRuntime {
                 let ordered = ext_args_source_order::<4>(&args);
                 let color = ordered[2] as u32;
                 let effect_color = ordered[3] as u32;
-                self.text_state.text_color = color;
-                self.text_state.text_effect_color = effect_color;
+                self.text_state.text_color = opaque_pal_font_color(color);
+                self.text_state.text_effect_color = opaque_pal_font_color(effect_color);
                 self.text_state.reveal_enabled = false;
                 self.text_state.dirty = true;
                 log::debug!(
@@ -7324,7 +7336,7 @@ impl ScriptRuntime {
             28 => self.ext_sp_get_pos_to_mem(sprites),
             29 => self.ext_sp_get_dimension(sprites, true),
             30 => self.ext_sp_get_dimension(sprites, false),
-            31 => self.ext_sp_surface_op(9),
+            31 => self.ext_sp_surface_image(assets, nls, resource_manager, sprites),
             32 => self.ext_sp_create(sprites),
             34 => self.ext_sp_set_anim_param(),
             35 => self.ext_sp_get_anim_param(),
@@ -7505,7 +7517,7 @@ impl ScriptRuntime {
             )
         };
         desc.visible = entry_flag != 0;
-        desc.base_priority = 100;
+        desc.base_priority = BUTTON_RENDER_PRIORITY;
         desc.source_name = source_name.clone();
         let handle = sprites.create(desc);
         if let Some((asset_name, bytes)) = pending_button_animation {
@@ -10695,9 +10707,64 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    fn ext_sp_surface_op(&mut self, arity: usize) -> ExtCallOutcome {
-        self.pop_ext_args(arity);
-        ExtCallOutcome::Value(1)
+    /// Paint an image resource into an existing sprite's surface. Popup scripts
+    /// use this to put the question artwork on top of POP_BASE before showing
+    /// the sprite; no separate text sprite is created for that artwork.
+    fn ext_sp_surface_image(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(9);
+        if args.len() < 9 {
+            return ExtCallOutcome::Block;
+        }
+        let [slot, dst_x, dst_y, width, height, resource_value, src_x, src_y, mode]: [i32; 9] =
+            args.try_into().expect("nine surface-image arguments");
+        let (Some(resource_manager), Some(sprites)) = (resource_manager, sprites) else {
+            return ExtCallOutcome::Value(0);
+        };
+        let Some(handle) = self.game_sprites.get(&slot).copied() else {
+            return ExtCallOutcome::Value(0);
+        };
+        let Some(name) = self.resolve_resource_string(resource_value, assets, nls) else {
+            return ExtCallOutcome::Value(0);
+        };
+        let asset = match open_resource_variant(resource_manager, &name, IMAGE_EXTENSIONS) {
+            Ok(asset) => asset,
+            Err(err) => {
+                log::warn!("[trace-sprite] surface_image resource={name:?} open failed: {err}");
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        let decoded = match decode_asset_image(resource_manager, &asset) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("[trace-sprite] surface_image resource={name:?} decode failed: {err}");
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        if mode != 0 {
+            log::debug!("[trace-sprite] surface_image resource={name:?} mode={mode}");
+        }
+        let painted = sprites.composite_rgba_to_sprite(
+            handle,
+            dst_x,
+            dst_y,
+            decoded.width,
+            decoded.height,
+            &decoded.rgba,
+            src_x,
+            src_y,
+            width.max(0) as u32,
+            height.max(0) as u32,
+        );
+        log::debug!(
+            "[trace-sprite] surface_image slot={slot} resource={name:?} dst=({dst_x},{dst_y}) src=({src_x},{src_y}) size=({width},{height}) painted={painted}"
+        );
+        ExtCallOutcome::Value(i32::from(painted))
     }
 
     /// Game category 3 index 55 (`sub_425EF0`, native log `sp_set_mask`).
@@ -15464,6 +15531,14 @@ fn argb_to_rgba_bytes(color: u32) -> [u8; 4] {
         (color & 0xFF) as u8,
         ((color >> 24) & 0xFF) as u8,
     ]
+}
+
+fn opaque_pal_font_color(color: u32) -> u32 {
+    if color & 0xFF00_0000 == 0 {
+        color | 0xFF00_0000
+    } else {
+        color
+    }
 }
 
 fn text_end_cursor(

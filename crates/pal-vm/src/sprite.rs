@@ -915,6 +915,42 @@ impl SpriteSystem {
         blit_rgba_to_surface(surface, x, y, width, height, rgba, BlendMode::CopyRgba)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_rgba_to_sprite(
+        &mut self,
+        handle: SpriteHandle,
+        dst_x: i32,
+        dst_y: i32,
+        src_width: u32,
+        src_height: u32,
+        rgba: &[u8],
+        src_x: i32,
+        src_y: i32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if rgba.len() < src_width as usize * src_height as usize * 4 {
+            return false;
+        }
+        let Some(surface_id) = self.get(handle).map(|sprite| sprite.surface) else {
+            return false;
+        };
+        let Some(surface) = self.surface_mut(surface_id) else {
+            return false;
+        };
+        blit_surface_to_surface(
+            surface,
+            dst_x,
+            dst_y,
+            (src_width, src_height, rgba),
+            src_x,
+            src_y,
+            width,
+            height,
+            BlendMode::SourceOver,
+        )
+    }
+
     pub fn paint(&mut self, handle: SpriteHandle, x: i32, y: i32, color: PalColor) -> bool {
         let Some(surface_id) = self.get(handle).map(|sprite| sprite.surface) else {
             return false;
@@ -1151,6 +1187,7 @@ impl SpriteSystem {
 enum BlendMode {
     CopyRgba,
     AlphaRgb,
+    SourceOver,
 }
 
 fn blit_rgba_to_surface(
@@ -1269,6 +1306,20 @@ fn blend_pixel(dst: &mut [u8], src: &[u8], mode: BlendMode) {
                 let dst_value = u16::from(dst[channel]);
                 dst[channel] = (((dst_value * (255 - alpha)) + (src_value * alpha)) >> 8) as u8;
             }
+        }
+        BlendMode::SourceOver => {
+            let src_alpha = u32::from(src[3]);
+            if src_alpha == 0 {
+                return;
+            }
+            let dst_alpha = u32::from(dst[3]);
+            let out_alpha = src_alpha + (dst_alpha * (255 - src_alpha) + 127) / 255;
+            for channel in 0..3 {
+                let numerator = u32::from(src[channel]) * src_alpha * 255
+                    + u32::from(dst[channel]) * dst_alpha * (255 - src_alpha);
+                dst[channel] = ((numerator + out_alpha * 127) / (out_alpha * 255)) as u8;
+            }
+            dst[3] = out_alpha as u8;
         }
     }
 }
