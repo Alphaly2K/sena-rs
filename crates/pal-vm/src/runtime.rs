@@ -24,8 +24,8 @@ use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
 use crate::save_format::{
     composite_thumbnail, decode_original_save, encode_original_save, mosaic_rgba,
     original_prefix_len, original_save_filename, original_save_path, read_lock_dword,
-    OriginalSavePrefix, ThumbnailSprite, DEFAULT_THUMB_HEIGHT, DEFAULT_THUMB_WIDTH,
-    HEADER_BEFORE_PIXELS, LOAD_THUMBNAIL_CAPTURE_SENTINEL, MOSAIC_FACTOR,
+    read_original_text_value, OriginalSavePrefix, ThumbnailSprite, DEFAULT_THUMB_HEIGHT,
+    DEFAULT_THUMB_WIDTH, HEADER_BEFORE_PIXELS, LOAD_THUMBNAIL_CAPTURE_SENTINEL, MOSAIC_FACTOR,
 };
 use crate::scene::{FrameScene, SceneTextureId, SolidQuad};
 use crate::sprite::{
@@ -664,6 +664,10 @@ struct TextSubsystemState {
     text_effect_color: u32,
     last_text_value: i32,
     last_text_args: [i32; 4],
+    /// Script offset of the most recent `text` command. The native engine
+    /// mirrors this into the save image header (`c20+0x20`, file offset
+    /// `0x20C`) on every text command and re-enters the script there on load.
+    last_text_pc: u32,
     init_args: [i32; 8],
     last_event_time_ms: u32,
     reveal_start_ms: u32,
@@ -750,6 +754,7 @@ impl Default for TextSubsystemState {
             text_effect_color: 0xFFFF_FFFF,
             last_text_value: 0,
             last_text_args: [0; 4],
+            last_text_pc: 0,
             init_args: [0; 8],
             last_event_time_ms: 0,
             reveal_start_ms: 0,
@@ -817,6 +822,10 @@ struct SaveSubsystemState {
     checkpoint: Option<RuntimeSaveSnapshot>,
     /// Most recent ADV wait before the save menu changes the scene.
     resume_checkpoint: Option<RuntimeSaveSnapshot>,
+    /// Point id registered through `set_load_after_process` (category 10
+    /// index 24). The native engine jumps the script VM to this point after a
+    /// successful `load`.
+    load_after_point: Option<i32>,
     snapshots: BTreeMap<i32, RuntimeSaveSnapshot>,
     text_sprites: BTreeMap<(i32, i32, i32), SpriteHandle>,
     thumbnail_sprites: BTreeMap<(i32, i32, i32), SpriteHandle>,
@@ -861,6 +870,10 @@ struct SavedButton {
     priority: i32,
     width: u32,
     height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    rect: [i32; 4],
+    color: u32,
     name: String,
     rgba: Vec<u8>,
 }
@@ -2483,6 +2496,10 @@ impl ScriptRuntime {
                     if self.save_state.armed && is_adv_wait && matches!(req, WaitRequest::Click) {
                         let mut snapshot = self.capture_resumable_scene(sprites.as_deref());
                         snapshot.resume_wait_click = true;
+                        // The parked line is fully revealed on restore, so its
+                        // click mark should show even when the checkpoint was
+                        // captured while the typewriter reveal was running.
+                        snapshot.show_wait_mark = true;
                         let (body, name) = self.adv_text_parts_for_render(
                             assets,
                             resource_manager
@@ -2794,6 +2811,18 @@ impl ScriptRuntime {
                 ));
                 // Store for extcall handlers that need it
                 self.extcall_dst_raw = dst_slot_raw;
+                if category == 2 && index == 2 {
+                    // Native AdvCommandText mirrors the current text command
+                    // position into the save image header on every line.
+                    self.text_state.last_text_pc = insn_pc;
+                    // koikake's ADV body is a linear run of text commands; each
+                    // one submits a line and parks in a click wait without an
+                    // intervening wait_click. Mark the wait so the blocked path
+                    // refreshes the resumable checkpoint per line, otherwise
+                    // saves keep the stale savepoint pc and loads replay the
+                    // section from its start.
+                    self.adv_wait_checkpoint_pending = true;
+                }
                 // Check if there is a Rust handler; if not, null-handler semantics: write 0 to
                 // dst and continue (matches original behavior for null-category dispatches).
                 let result = self.dispatch_extcall(
@@ -5145,6 +5174,31 @@ impl ScriptRuntime {
                         ExtCallOutcome::Value(1)
                     };
                 }
+                // Original-engine saves carry no portable trailer. Their header
+                // still stores the script offset of the current text command
+                // (file offset 0x20C, wrapper `c20+0x20`); re-entering the
+                // script there replays the line and continues the scenario,
+                // which is how the native engine resumes without persisting
+                // VM state.
+                if let Some(mut snapshot) = resource_manager
+                    .as_deref()
+                    .and_then(|manager| self.import_original_save(manager.root(), slot, assets))
+                {
+                    let resume_pc = snapshot.pc;
+                    self.save_state.snapshots.insert(slot, snapshot.clone());
+                    let scene = snapshot.clone();
+                    self.restore_save_snapshot(snapshot);
+                    if let Some(sprites) = sprites.as_deref_mut() {
+                        self.restore_checkpoint_scene(&scene, sprites);
+                    }
+                    self.wait_task_handle = None;
+                    self.wait_task_kind = None;
+                    self.save_state.last_result = 1;
+                    log::debug!(
+                        "[trace-save] load slot={slot} imported original save, resume pc=0x{resume_pc:08X}"
+                    );
+                    return ExtCallOutcome::Value(1);
+                }
                 let has_file = resource_manager
                     .as_ref()
                     .and_then(|manager| {
@@ -5307,7 +5361,14 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             24 => {
-                self.pop_ext_args(0);
+                // `set_load_after_process(point)` registers the script point the
+                // native VM jumps to after a successful `load`.
+                let args = self.pop_ext_args(1);
+                self.save_state.load_after_point = args.first().copied();
+                log::debug!(
+                    "[trace-save] set_load_after_process point={:?}",
+                    self.save_state.load_after_point
+                );
                 ExtCallOutcome::Value(1)
             }
             25 => {
@@ -5433,6 +5494,8 @@ impl ScriptRuntime {
             lock: self.save_state.locks.get(&slot).copied().unwrap_or(0),
             title: self.save_state.title_bytes.clone(),
             mosaic: i32::from(self.save_state.mosaic_enabled),
+            resume_pc: self.text_state.last_text_pc as i32,
+            secondary_pc: -1,
             thumb_width: width,
             thumb_height: height,
             pixels,
@@ -11634,7 +11697,7 @@ impl ScriptRuntime {
 
     fn capture_save_snapshot(&self) -> RuntimeSaveSnapshot {
         RuntimeSaveSnapshot {
-            version: 2,
+            version: 4,
             pc: self.pc,
             call_stack: self.call_stack.clone(),
             user_mem: bounded_i32_copy(&self.user_mem, DEFAULT_MEM_SIZE),
@@ -11764,6 +11827,15 @@ impl ScriptRuntime {
                 priority: sprite.base_priority,
                 width: texture.width,
                 height: texture.height,
+                cell_width: sprite.cell_size.width,
+                cell_height: sprite.cell_size.height,
+                rect: [
+                    sprite.source_rect.left,
+                    sprite.source_rect.top,
+                    sprite.source_rect.right,
+                    sprite.source_rect.bottom,
+                ],
+                color: sprite.color.0,
                 name: entry.name.chars().take(SAVE_NAME_CAP).collect(),
                 rgba: texture.pixels[..expected].to_vec(),
             });
@@ -11772,6 +11844,60 @@ impl ScriptRuntime {
             }
         }
         records
+    }
+
+    /// Builds a resumable snapshot from an original-engine save that has no
+    /// portable trailer.
+    ///
+    /// The original image stores no VM call stack or memory bodies (verified
+    /// against koikake save010/save005), but its header keeps the script
+    /// offset of the text command that was current when the image was
+    /// assembled (wrapper `c20+0x20`, file offset `0x20C`). The native engine
+    /// resumes *after* that instruction with the text window state restored,
+    /// so the parked line still shows and waits for a click; here the visible
+    /// line is rebuilt from the image's text value (file offset `0x12A3C`)
+    /// and the wait is re-armed through `resume_wait_click`.
+    fn import_original_save(
+        &self,
+        root: &Path,
+        slot: i32,
+        assets: &CoreAssets,
+    ) -> Option<RuntimeSaveSnapshot> {
+        let path = find_loose_save_file(root, &original_save_filename(slot))?;
+        let bytes = std::fs::read(path).ok()?;
+        let (prefix, trailer) = decode_original_save(&bytes)?;
+        if trailer.is_some() {
+            // A portable trailer exists but failed to parse; do not guess.
+            return None;
+        }
+        let resume_pc = prefix.resume_pc;
+        // +0xC: the native tracker points past the current text extcall
+        // (opcode word + category/index + dst slot), and resumes there.
+        let resume_next = resume_pc as usize + 0xC;
+        if resume_pc <= 0 || resume_next >= assets.script.bytes.len() {
+            log::debug!("[trace-save] import slot={slot} rejected resume pc=0x{resume_pc:08X}");
+            return None;
+        }
+        let text_value = read_original_text_value(&bytes).unwrap_or(0);
+        let mut snapshot = self.capture_save_snapshot();
+        snapshot.pc = resume_next as u32;
+        // The call stack is not persisted by the native engine either; resume
+        // with an empty one. The operand stack of the interrupted menu script
+        // is dropped so the resumed runner starts balanced.
+        snapshot.call_stack = Vec::new();
+        snapshot.stack = Vec::new();
+        // The scene is re-issued by the script as it continues; drop live
+        // sprite and button records so the menu does not linger.
+        snapshot.sprites = Vec::new();
+        snapshot.buttons = Vec::new();
+        snapshot.button_groups = Vec::new();
+        if text_value != 0 {
+            snapshot.text_args = [0, text_value, 0x0FFF_FFFF, 0x0FFF_FFFF];
+            snapshot.text_visible = true;
+            snapshot.show_wait_mark = true;
+        }
+        snapshot.resume_wait_click = true;
+        Some(snapshot)
     }
 
     fn restore_save_snapshot(&mut self, snapshot: RuntimeSaveSnapshot) {
@@ -11867,6 +11993,19 @@ impl ScriptRuntime {
             ) else {
                 continue;
             };
+            // Button sheets stack one cell per state; restoring the full
+            // texture without its cell window draws every state at once.
+            let _ = sprites.set_offset_rect(handle, record.cell_width, record.cell_height);
+            let _ = sprites.set_rect(
+                handle,
+                Some(PalRect::new(
+                    record.rect[0],
+                    record.rect[1],
+                    record.rect[2],
+                    record.rect[3],
+                )),
+            );
+            let _ = sprites.set_color(handle, PalColor(record.color));
             let _ = sprites.view_ctrl(handle, record.visible);
             self.game_buttons.insert(
                 (record.group, record.index),
@@ -14304,7 +14443,7 @@ fn portable_system_data_path(root: &Path) -> PathBuf {
 fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"SENARSAV");
-    write_u32(&mut bytes, 3)?;
+    write_u32(&mut bytes, 4)?;
     write_u32(&mut bytes, snapshot.pc)?;
     write_u32_vec(&mut bytes, &snapshot.call_stack)?;
     write_i32_vec(
@@ -14456,7 +14595,7 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
         ));
     }
     let version = read_u32_from(reader)?;
-    if !(1..=3).contains(&version) {
+    if !(1..=4).contains(&version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported portable save version",
@@ -14526,7 +14665,7 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
         snapshot.thumb_height = read_i32_from(reader)?;
         snapshot.thumb_pixels = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
         snapshot.sprites = read_saved_sprites(reader)?;
-        snapshot.buttons = read_saved_buttons(reader)?;
+        snapshot.buttons = read_saved_buttons(reader, version)?;
         let group_len = read_u32_from(reader)? as usize;
         if group_len > SAVE_SPRITE_CAP {
             return Err(std::io::Error::new(
@@ -14630,6 +14769,12 @@ fn write_saved_buttons(out: &mut Vec<u8>, buttons: &[SavedButton]) -> std::io::R
         write_i32(out, button.priority)?;
         write_u32(out, button.width)?;
         write_u32(out, button.height)?;
+        write_u32(out, button.cell_width)?;
+        write_u32(out, button.cell_height)?;
+        for value in button.rect {
+            write_i32(out, value)?;
+        }
+        write_u32(out, button.color)?;
         write_bytes(out, button.name.as_bytes(), SAVE_NAME_CAP)?;
         write_bytes(out, &button.rgba, SAVE_SPRITE_BYTES_CAP)?;
     }
@@ -14739,7 +14884,7 @@ fn read_saved_sprites(reader: &mut impl Read) -> std::io::Result<Vec<SavedSprite
     Ok(sprites)
 }
 
-fn read_saved_buttons(reader: &mut impl Read) -> std::io::Result<Vec<SavedButton>> {
+fn read_saved_buttons(reader: &mut impl Read, version: u32) -> std::io::Result<Vec<SavedButton>> {
     let len = read_u32_from(reader)? as usize;
     if len > SAVE_SPRITE_CAP {
         return Err(std::io::Error::new(
@@ -14760,6 +14905,25 @@ fn read_saved_buttons(reader: &mut impl Read) -> std::io::Result<Vec<SavedButton
         let priority = read_i32_from(reader)?;
         let width = read_u32_from(reader)?;
         let height = read_u32_from(reader)?;
+        // Version 4 records the cell window; older images only carry the full
+        // sheet, so fall back to a single whole-texture cell.
+        let (cell_width, cell_height, rect, color) = if version >= 4 {
+            let cell_width = read_u32_from(reader)?;
+            let cell_height = read_u32_from(reader)?;
+            let mut rect = [0_i32; 4];
+            for value in &mut rect {
+                *value = read_i32_from(reader)?;
+            }
+            let color = read_u32_from(reader)?;
+            (cell_width, cell_height, rect, color)
+        } else {
+            (
+                width.max(1),
+                height.max(1),
+                [0, 0, width as i32, height as i32],
+                0xFFFF_FFFF,
+            )
+        };
         let name = String::from_utf8_lossy(&read_bytes_capped(reader, SAVE_NAME_CAP)?).into_owned();
         let rgba = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
         buttons.push(SavedButton {
@@ -14775,6 +14939,10 @@ fn read_saved_buttons(reader: &mut impl Read) -> std::io::Result<Vec<SavedButton
             priority,
             width,
             height,
+            cell_width,
+            cell_height,
+            rect,
+            color,
             name,
             rgba,
         });
@@ -16088,10 +16256,10 @@ mod tests {
         assert_eq!(restored.vars, snapshot.vars);
         assert_eq!(restored.argument_base, 64);
         assert_eq!(restored.title_bytes, b"line");
-        assert_eq!(restored.version, 3);
+        assert_eq!(restored.version, 4);
         assert!(restored.resume_wait_click);
 
-        let mut older_bytes = encode_runtime_save_snapshot(&snapshot).expect("encode v3");
+        let mut older_bytes = encode_runtime_save_snapshot(&snapshot).expect("encode v4");
         older_bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
         older_bytes.pop();
         let older = decode_runtime_save_snapshot(&mut older_bytes.as_slice()).expect("read v2");
@@ -16162,6 +16330,8 @@ mod tests {
                     .encode(&format!("保存{slot}"))
                     .expect("SJIS title"),
                 mosaic: 0,
+                resume_pc: 0,
+                secondary_pc: -1,
                 thumb_width: 2,
                 thumb_height: 2,
                 pixels: vec![slot as u8 + 1; 16],
@@ -16401,5 +16571,230 @@ mod tests {
         assert_eq!(&patched[..4], &1_i32.to_le_bytes());
         assert_eq!(&patched[4..], &original[4..]);
         let _ = std::fs::remove_file(copy);
+    }
+
+    #[test]
+    fn import_original_save_resumes_at_recorded_text_pc() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_import_original_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("save")).expect("save dir");
+        let prefix = OriginalSavePrefix {
+            lock: 0,
+            title: Nls::ShiftJis.encode("import").expect("SJIS title"),
+            mosaic: 0,
+            resume_pc: 0x1234,
+            secondary_pc: -1,
+            thumb_width: 2,
+            thumb_height: 2,
+            pixels: vec![0; 16],
+        };
+        std::fs::write(
+            original_save_path(&root, 0),
+            encode_original_save(&prefix, &[]),
+        )
+        .expect("save fixture");
+
+        let mut runtime = ScriptRuntime::boot(0x100, ScriptRuntimeConfig::default());
+        runtime.user_mem[7] = 99;
+        runtime.system_mem[8] = 88;
+        runtime.stack = vec![1, 2, 3];
+        runtime.call_stack = vec![0x500];
+
+        let script_bytes = vec![0u8; 0x2000];
+        let assets = CoreAssets {
+            script: LoadedAsset {
+                name: "Script.src".to_owned(),
+                bytes: script_bytes,
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Script.src"),
+                },
+            },
+            file_dat: LoadedAsset {
+                name: "File.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("File.dat"),
+                },
+            },
+            text_dat: LoadedAsset {
+                name: "Text.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Text.dat"),
+                },
+            },
+            mem_dat: LoadedAsset {
+                name: "Mem.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Mem.dat"),
+                },
+            },
+            point_dat: LoadedAsset {
+                name: "Point.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Point.dat"),
+                },
+            },
+            graphic_dat: None,
+            script_check_value: 0,
+            script_entry_pc: 0x100,
+            extended_softpal: false,
+            point_table: PointTable::parse(&[]).expect("empty Point.dat should parse"),
+            graphic_index: None,
+        };
+
+        let snapshot = runtime
+            .import_original_save(&root, 0, &assets)
+            .expect("original save without trailer should import");
+        // The resume target is the instruction after the recorded text call.
+        assert_eq!(snapshot.pc, 0x1240);
+        assert!(snapshot.call_stack.is_empty());
+        assert!(snapshot.stack.is_empty());
+        assert!(snapshot.sprites.is_empty());
+        assert!(snapshot.buttons.is_empty());
+        assert!(snapshot.resume_wait_click);
+        // The original image carries no memory bodies; they stay live.
+        assert_eq!(snapshot.user_mem[7], 99);
+        assert_eq!(snapshot.system_mem[8], 88);
+
+        // An out-of-script resume offset is rejected.
+        let mut bad = prefix.clone();
+        bad.resume_pc = 0x4000;
+        std::fs::write(
+            original_save_path(&root, 1),
+            encode_original_save(&bad, &[]),
+        )
+        .expect("bad save fixture");
+        assert!(runtime.import_original_save(&root, 1, &assets).is_none());
+        // A missing file imports nothing.
+        assert!(runtime.import_original_save(&root, 7, &assets).is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Real-game fixture: `testcase/` must be a koikake game root with the
+    /// original engine's `save010.dat` copied to `save/save000.dat`.
+    #[test]
+    #[ignore = "needs a local koikake game root at testcase/ with save/save000.dat"]
+    fn original_save_fixture_replays_the_first_line() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testcase");
+        let mut resource_manager =
+            ResourceManager::bootstrap(&root, Nls::ShiftJis).expect("game root");
+        let assets = CoreAssets::load(&mut resource_manager, None).expect("core assets");
+        let mut runtime = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        let snapshot = runtime
+            .import_original_save(&root, 0, &assets)
+            .expect("original save010 should import");
+        assert_eq!(snapshot.pc, 0x6B6F8, "resume past the parked text command");
+        runtime.restore_save_snapshot(snapshot);
+
+        // The parked line is restored visible without running any script.
+        assert!(runtime.text_state.visible);
+        assert_eq!(runtime.text_state.last_text_value, 6557);
+        assert!(runtime.text_state.show_wait_mark);
+
+        // Continuing runs into the next line's text command.
+        let config = ScriptRuntimeConfig::default();
+        let mut waited = false;
+        for _ in 0..64 {
+            let tick = runtime
+                .run_frame(&assets, &config)
+                .expect("frame should run");
+            if matches!(tick.status, RuntimeStatus::WaitClick { .. })
+                || matches!(tick.status, RuntimeStatus::WaitFrame { .. })
+            {
+                if runtime.text_state.last_text_value == 6588 {
+                    waited = true;
+                    break;
+                }
+            }
+        }
+        assert!(waited, "the next line should display after resume");
+    }
+
+    /// Real-game fixture: ADV text commands park in a click wait without an
+    /// intervening wait_click, so the resumable checkpoint must refresh at
+    /// each parked line. Saving must not fall back to the savepoint pc, which
+    /// replays the section from its start.
+    ///
+    /// `testcase/` must be a koikake game root with the original engine's
+    /// `save010.dat` copied to `save/save000.dat`.
+    #[test]
+    #[ignore = "needs a local koikake game root at testcase/ with save/save000.dat"]
+    fn adv_lines_refresh_the_resume_checkpoint() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testcase");
+        let mut resource_manager =
+            ResourceManager::bootstrap(&root, Nls::ShiftJis).expect("game root");
+        let assets = CoreAssets::load(&mut resource_manager, None).expect("core assets");
+        let mut runtime = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        // Enter the ADV section through the original save parked on the first
+        // line, then arm saving the way the script's savepoint extcall does.
+        let snapshot = runtime
+            .import_original_save(&root, 0, &assets)
+            .expect("original save010 should import");
+        runtime.restore_save_snapshot(snapshot);
+        runtime.save_state.armed = true;
+        let config = ScriptRuntimeConfig::default();
+
+        // Run until the third ADV line (text id 6649) is parked.
+        let mut parked = false;
+        for _ in 0..40_000 {
+            runtime.run_frame(&assets, &config).expect("frame");
+            if runtime.text_state.last_text_value == 6649 {
+                parked = true;
+                break;
+            }
+            if matches!(runtime.status, RuntimeStatus::WaitClick { .. }) {
+                runtime.resolve_pending_wait();
+            }
+        }
+        assert!(parked, "the third ADV line should be parked");
+        let checkpoint = runtime
+            .save_state
+            .resume_checkpoint
+            .clone()
+            .expect("ADV line waits must refresh the resume checkpoint");
+        assert_eq!(checkpoint.text_args[1], 6649);
+        assert!(checkpoint.resume_wait_click);
+        assert!(checkpoint.show_wait_mark);
+        // The checkpoint resumes right after the parked text command
+        // (0x6B750 follows the text call at 0x6B744 for line 6649).
+        assert_eq!(checkpoint.pc, 0x6B750);
+
+        // Restoring into a fresh runtime resumes at the parked line and the
+        // next click advances into the following line (text id 6692).
+        let mut restored = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        restored.restore_save_snapshot(checkpoint);
+        assert!(restored.text_state.visible);
+        assert_eq!(restored.text_state.last_text_value, 6649);
+        let mut advanced = false;
+        for _ in 0..400 {
+            restored.run_frame(&assets, &config).expect("frame");
+            if restored.text_state.last_text_value == 6692 {
+                advanced = true;
+                break;
+            }
+            if matches!(restored.status, RuntimeStatus::WaitClick { .. }) {
+                restored.resolve_pending_wait();
+            }
+        }
+        assert!(advanced, "resume should continue into the next line");
     }
 }
