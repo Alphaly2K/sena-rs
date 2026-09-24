@@ -128,7 +128,7 @@ fn apply_graphic_record_lanes(
     if record.priority_lane != 0 {
         desc.base_priority = desc
             .base_priority
-            .saturating_add(record.priority_lane.saturating_mul(134));
+            .saturating_sub(record.priority_lane.saturating_mul(134));
     }
     if record.offset_x != 0 || record.offset_y != 0 {
         desc.position.x += record.offset_x as f32;
@@ -145,21 +145,25 @@ fn apply_graphic_record_lanes(
     }
 }
 
-fn game_sprite_priority(slot: i32) -> i32 {
-    let slot_order = slot.clamp(0, 999);
-    // PalSprite::effective_priority() adds position.z.  The base priority is
-    // only the stable PAL slot tie-breaker, so same-z layers draw in script
-    // slot order without double-counting z.
-    slot_order
+// Both Game.exe variants assign a depth from the shared priority cursor when
+// each entry is created: ordinary sprites use 0x1387 - slot (Koikake 0x411150,
+// TotsuLover 0x42805B), buttons use 0x1302 - index (Koikake 0x40F5C4,
+// TotsuLover 0x4251E8). PAL paints smaller native depths in front; our render
+// tree paints larger priorities last, so reverse the sign here.
+fn game_sprite_priority(slot: i32, cursor: i32) -> i32 {
+    slot.saturating_sub(0x1387i32.saturating_add(cursor))
 }
 
-// Popup scripts place their frame in sprite slot 127. Buttons live in a
-// separate PAL table, so draw them after that frame in our shared render tree.
-const BUTTON_RENDER_PRIORITY: i32 = 128;
+fn button_render_priority(index: i32, cursor: i32) -> i32 {
+    index.saturating_sub(0x1302i32.saturating_add(cursor))
+}
 
-// Save-slot button surfaces use the button priority. `thumbnail_set` and the save
-// text draw calls paint onto their shared canvas in PAL; when represented as
-// separate sprites they must sit above those translucent button surfaces.
+// Synthetic ADV text and save drawings still use separate sprites rather than
+// pixels painted into their native surfaces. This is not btn_set's depth.
+const BUTTON_RENDER_PRIORITY: i32 = 100;
+
+// `thumbnail_set` and the save text draw calls paint onto a shared canvas in
+// PAL; the separate sprites in this renderer must sit above that canvas.
 const SAVE_DRAWING_PRIORITY: i32 = BUTTON_RENDER_PRIORITY + 1;
 
 #[derive(Clone, Debug)]
@@ -8015,7 +8019,7 @@ impl ScriptRuntime {
             )
         };
         desc.visible = entry_flag != 0;
-        desc.base_priority = BUTTON_RENDER_PRIORITY;
+        desc.base_priority = button_render_priority(index, self.sprite_priority_cursor);
         desc.smooth_upscale = true;
         desc.source_name = source_name.clone();
         let handle = sprites.create(desc);
@@ -9120,7 +9124,7 @@ impl ScriptRuntime {
         sprites.insert_surface(surface);
         let mut desc = SpriteDesc::new(SceneTextureId(surface_id.0), 1, 1);
         desc.visible = false;
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.source_name = format!("sp_create:{slot}");
         let handle = sprites.create(desc);
         self.game_sprites.insert(slot, handle);
@@ -9372,7 +9376,7 @@ impl ScriptRuntime {
             logical_width.max(1) as f32 / 1920.0,
             logical_height.max(1) as f32 / 1080.0,
         ));
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.visible = true;
         if fade_replace {
             desc.color = PalColor::from_argb(0x00FF_FFFF);
@@ -9623,7 +9627,10 @@ impl ScriptRuntime {
                 logical_height.max(1) as f32 / 1080.0,
             ));
         }
-        desc.base_priority = game_sprite_priority(face.sprite_slot);
+        // face_set has already folded the cursor, lane and slot into `z`.
+        // PalSprite adds position.z to base_priority, so compensate here to
+        // keep the native depth's front-to-back direction.
+        desc.base_priority = 0i32.saturating_sub(z).saturating_sub(z);
         desc.visible = true;
         desc.source_name = asset.name.clone();
         let face_alpha =
@@ -9757,7 +9764,7 @@ impl ScriptRuntime {
         }
         desc.position = PalVec3::new(x, y, z);
         desc.center_scale = true;
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.visible = true;
         desc.source_name = source_name.to_owned();
         let handle = sprites.create(desc);
@@ -9872,7 +9879,10 @@ impl ScriptRuntime {
                 return ExtCallOutcome::Value(0);
             }
             sprites.set_pos(handle, x, y, z);
-            sprites.set_priority(handle, game_sprite_priority(slot));
+            sprites.set_priority(
+                handle,
+                game_sprite_priority(slot, self.sprite_priority_cursor),
+            );
             self.apply_pending_alpha_actions(sprites, slot, handle);
         } else {
             let Some(handle) = sprites.create_rgba_sprite(
@@ -9880,7 +9890,7 @@ impl ScriptRuntime {
                 height,
                 rgba,
                 PalVec3::new(x, y, z),
-                game_sprite_priority(slot),
+                game_sprite_priority(slot, self.sprite_priority_cursor),
                 format!("text:{text}"),
             ) else {
                 return ExtCallOutcome::Value(0);
@@ -12033,7 +12043,7 @@ impl ScriptRuntime {
             logical_width.max(1) as f32 / 1920.0,
             logical_height.max(1) as f32 / 1080.0,
         ));
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.visible = true;
         desc.source_name = asset.name.clone();
         if let Some((
@@ -16904,16 +16914,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn popup_buttons_draw_above_the_popup_frame() {
+    fn script_priority_cursor_layers_popup_over_existing_buttons() {
         let mut sprites = SpriteSystem::new();
-        let button = sprites
+        let menu_button = sprites
             .create_rgba_sprite(
                 2,
                 2,
                 vec![255; 16],
                 PalVec3::new(0, 0, 0),
-                BUTTON_RENDER_PRIORITY,
-                "button",
+                button_render_priority(127, -134),
+                "settings button",
             )
             .unwrap();
         let frame = sprites
@@ -16922,8 +16932,18 @@ mod tests {
                 2,
                 vec![255; 16],
                 PalVec3::new(0, 0, 0),
-                127,
+                game_sprite_priority(127, -268),
                 "popup frame",
+            )
+            .unwrap();
+        let confirm_button = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                button_render_priority(0, -268),
+                "confirm button",
             )
             .unwrap();
         let order = sprites
@@ -16937,8 +16957,9 @@ mod tests {
         assert_eq!(
             order,
             [
+                sprites.get(menu_button).unwrap().surface.0,
                 sprites.get(frame).unwrap().surface.0,
-                sprites.get(button).unwrap().surface.0
+                sprites.get(confirm_button).unwrap().surface.0
             ]
         );
     }
