@@ -382,6 +382,7 @@ pub struct ScriptRuntime {
     button_groups: BTreeMap<i32, GameButtonGroup>,
     /// Latched button pushes keyed by group; consumed by btn_get_push(group).
     button_push_queue: BTreeMap<i32, VecDeque<i32>>,
+    adv_menu_expanded: bool,
     /// Game category 12 system/menu button table.
     system_buttons: BTreeMap<i32, GameSystemButtonEntry>,
     /// Game script sound slots mapped to PAL audio handles. Key is (script category, slot).
@@ -1143,6 +1144,7 @@ impl ScriptRuntime {
             title_modal_buttons: None,
             button_groups: BTreeMap::new(),
             button_push_queue: BTreeMap::new(),
+            adv_menu_expanded: false,
             system_buttons: BTreeMap::new(),
             game_audio: BTreeMap::new(),
             master_volume_percent: 100,
@@ -1618,7 +1620,6 @@ impl ScriptRuntime {
         mut resource_manager: Option<&mut ResourceManager>,
         sprites: &mut SpriteSystem,
     ) {
-        self.sync_adv_button_chrome_visibility(sprites);
         if !self.text_state.initialized {
             if let Some(handle) = self.text_state.sprite.take() {
                 let _ = sprites.release(handle);
@@ -1627,6 +1628,7 @@ impl ScriptRuntime {
                 let _ = sprites.release(handle);
             }
             self.text_state.dirty = false;
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
         if !self.text_state.visible {
@@ -1637,6 +1639,7 @@ impl ScriptRuntime {
                 let _ = sprites.view_ctrl(handle, false);
             }
             self.text_state.dirty = false;
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
         let reveal_complete = self.text_state.reveal_enabled
@@ -1648,6 +1651,7 @@ impl ScriptRuntime {
             && !self.text_state.reveal_enabled
             && !self.text_state.show_wait_mark
         {
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
         let log_sync = self.text_state.dirty;
@@ -1667,6 +1671,7 @@ impl ScriptRuntime {
                 let _ = sprites.release(handle);
             }
             self.text_state.dirty = false;
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
         let saved_size = self.font_state.font_size();
@@ -1863,23 +1868,64 @@ impl ScriptRuntime {
         self.font_state.set_font_size(saved_size);
         self.font_state.set_color(saved_color.0, saved_color.1);
         self.text_state.dirty = false;
+        self.sync_adv_button_chrome_visibility(sprites);
     }
 
     fn sync_adv_button_chrome_visibility(&mut self, sprites: &mut SpriteSystem) {
-        let chrome_visible =
-            self.text_state.initialized && self.text_state.visible && !self.history_state.active;
+        let chrome_visible = self.text_state.initialized
+            && self.text_state.visible
+            && !self.history_state.active
+            && self
+                .text_state
+                .sprite
+                .is_some_and(|handle| sprites.get(handle).is_some_and(|sprite| sprite.visible));
+        let menu_bases = self.adv_menu_bases(sprites);
         for ((group, _), entry) in self.game_buttons.iter() {
             if *group != 0 {
                 continue;
             }
-            // Group-0 includes registered helper controls such as
-            // MAIN_BTN_VOICE.  Native expansion state 2/4 disables those
-            // pop-out controls while keeping their PAL objects addressable by
-            // tagged slots like 0x0200000E; alpha animations must not resurrect
-            // them into the normal ADV chrome.
-            let visible = chrome_visible && entry.visible && entry.enabled;
+            // A paired compact/expanded base defines an ADV menu. Keep its
+            // compact button visible while the script's separate panel sprites
+            // animate, and reveal panel controls only after a menu click.
+            let inline_quick_button = menu_bases.is_none()
+                && (entry.name.eq_ignore_ascii_case("MAIN_BTN_QSAVE")
+                    || entry.name.eq_ignore_ascii_case("MAIN_BTN_QLOAD"));
+            let visible = if let Some((compact, expanded, panel_left)) = menu_bases {
+                if entry.handle == compact {
+                    chrome_visible && entry.visible && !self.adv_menu_expanded
+                } else if entry.handle == expanded {
+                    chrome_visible && entry.visible && self.adv_menu_expanded
+                } else {
+                    let on_panel = sprites
+                        .get(entry.handle)
+                        .is_some_and(|sprite| sprite.effective_position().x >= panel_left);
+                    chrome_visible
+                        && entry.visible
+                        && entry.enabled
+                        && (!on_panel || self.adv_menu_expanded)
+                }
+            } else {
+                chrome_visible && entry.visible && entry.enabled
+            };
             let _ = sprites.view_ctrl(entry.handle, visible);
+            if visible && inline_quick_button && entry.alpha == 0 {
+                // Some scripts register the inline quick controls but leave
+                // their initial button alpha at zero while showing the rest
+                // of the same toolbar. Restore the cell's draw alpha here.
+                sprites.set_alpha(entry.handle, 255);
+            }
         }
+    }
+
+    fn adv_menu_bases(&self, sprites: &SpriteSystem) -> Option<(SpriteHandle, SpriteHandle, i32)> {
+        let compact = self.game_buttons.iter().find(|((group, _), entry)| {
+            *group == 0 && entry.name.eq_ignore_ascii_case("MAIN_BTN_BASE0")
+        })?.1;
+        let expanded = self.game_buttons.iter().find(|((group, _), entry)| {
+            *group == 0 && entry.name.eq_ignore_ascii_case("MAIN_BTN_BASE1")
+        })?.1;
+        let panel_left = sprites.get(expanded.handle)?.effective_position().x;
+        Some((compact.handle, expanded.handle, panel_left))
     }
 
     pub fn consume_text_reveal_push(&mut self, input: &PalInputState) -> bool {
@@ -2310,6 +2356,41 @@ impl ScriptRuntime {
         input: &PalInputState,
     ) -> bool {
         let (mouse_x, mouse_y) = input.mouse_position();
+        if input.mouse_push(PalMouseButton::Left)
+            && !self.adv_menu_expanded
+            && self.adv_menu_bases(sprites).is_some_and(|(compact, _, _)| {
+                sprites.get(compact).is_some_and(|sprite| {
+                    let pos = sprite.effective_position();
+                    sprite.visible
+                        && sprite.color.alpha() != 0
+                        && mouse_x >= pos.x
+                        && mouse_x < pos.x.saturating_add(sprite.source_rect.width())
+                        && mouse_y >= pos.y
+                        && mouse_y < pos.y.saturating_add(sprite.source_rect.height())
+                })
+            })
+        {
+            self.adv_menu_expanded = true;
+            self.sync_adv_button_chrome_visibility(sprites);
+            return true;
+        }
+        if input.mouse_push(PalMouseButton::Left)
+            && self.adv_menu_expanded
+            && self.adv_menu_bases(sprites).is_some_and(|(_, expanded, _)| {
+                sprites.get(expanded).is_some_and(|sprite| {
+                    let pos = sprite.effective_position();
+                    sprite.visible
+                        && mouse_x >= pos.x
+                        && mouse_x < pos.x.saturating_add(sprite.source_rect.width())
+                        && mouse_y >= pos.y
+                        && mouse_y < pos.y.saturating_add(40)
+                })
+            })
+        {
+            self.adv_menu_expanded = false;
+            self.sync_adv_button_chrome_visibility(sprites);
+            return true;
+        }
         let hovered = self.button_hit_at(sprites, mouse_x, mouse_y, -1);
         let mut consumed_mouse_push = false;
         if input.mouse_push(PalMouseButton::Left) {
@@ -7566,6 +7647,9 @@ impl ScriptRuntime {
             return ExtCallOutcome::Block;
         }
         let group = args[0];
+        if group == 0 {
+            self.adv_menu_expanded = false;
+        }
         let normal_image = args[1];
         let hover_image = args[2];
         self.button_groups.insert(
@@ -7590,6 +7674,9 @@ impl ScriptRuntime {
     fn ext_btn_uninit(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let group = args.first().copied().unwrap_or(-1);
+        if group < 0 || group == 0 {
+            self.adv_menu_expanded = false;
+        }
         if group < 0 || group == 1 {
             self.title_modal_buttons = None;
         }
@@ -7636,6 +7723,9 @@ impl ScriptRuntime {
         let args = self.pop_ext_args(2);
         let group = args.first().copied().unwrap_or(-1);
         let index = args.get(1).copied().unwrap_or(-1);
+        if group < 0 || (group == 0 && index < 0) {
+            self.adv_menu_expanded = false;
+        }
         let Some(sprites) = sprites else {
             self.forget_button_handles(group, index);
             return ExtCallOutcome::Value(1);
@@ -14192,7 +14282,10 @@ fn native_place_sprite(
     default_y: i32,
 ) -> (f32, f32, f32) {
     if raw_x == 0xFFFF && raw_y == 0xFFFF {
-        return (default_x as f32, default_y as f32, raw_z as f32);
+        // PGD default offsets are authored in the 1280x720 script space. The
+        // wrapper stores native 1920x1080 positions before projecting back
+        // to the configured logical stage; convert these offsets just once.
+        return (default_x as f32 * 1.5, default_y as f32 * 1.5, raw_z as f32);
     }
     if arg_count >= 5 {
         let mut x = raw_x;
@@ -16150,6 +16243,12 @@ enum StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pgd_default_offsets_use_native_stage_coordinates() {
+        let (x, y, z) = native_place_sprite(5, 0xFFFF, 0xFFFF, 70, 464, 144, 408, 288);
+        assert_eq!((x, y, z), (612.0, 432.0, 70.0));
+    }
 
     #[test]
     fn button_position_query_writes_requested_temporary_slots() {
