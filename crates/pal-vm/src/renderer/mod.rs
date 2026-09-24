@@ -427,22 +427,45 @@ fn draw_textured_rect(
     let src_y = sprite.src.y * texture.height as f32;
     let src_w = sprite.src.w * texture.width as f32;
     let src_h = sprite.src.h * texture.height as f32;
+    let smooth_upscale = sprite.smooth_upscale
+        && (dst_rect.w > src_w * 1.1 || dst_rect.h > src_h * 1.1);
+    let source_bounds = [
+        sprite.source_rect[0].max(0),
+        sprite.source_rect[1].max(0),
+        sprite.source_rect[2].saturating_sub(1).min(texture.width as i32 - 1),
+        sprite.source_rect[3].saturating_sub(1).min(texture.height as i32 - 1),
+    ];
     let tint = sprite.color;
     for y in y0..y1 {
-        let v = ((y as f32 - dst_rect.y) / dst_rect.h).clamp(0.0, 1.0);
-        let sy = (src_y + v * src_h)
-            .floor()
-            .clamp(0.0, texture.height.saturating_sub(1) as f32) as usize;
+        let v = ((y as f32 + 0.5 - dst_rect.y) / dst_rect.h).clamp(0.0, 1.0);
         for x in x0..x1 {
-            let u = ((x as f32 - dst_rect.x) / dst_rect.w).clamp(0.0, 1.0);
-            let sx = (src_x + u * src_w)
-                .floor()
-                .clamp(0.0, texture.width.saturating_sub(1) as f32) as usize;
-            let src_index = (sy * texture.width as usize + sx) * 4;
-            let r = (texture.pixels[src_index] as f32 * tint[0].clamp(0.0, 1.0)) as u8;
-            let g = (texture.pixels[src_index + 1] as f32 * tint[1].clamp(0.0, 1.0)) as u8;
-            let b = (texture.pixels[src_index + 2] as f32 * tint[2].clamp(0.0, 1.0)) as u8;
-            let a = (texture.pixels[src_index + 3] as f32 * tint[3].clamp(0.0, 1.0)) as u8;
+            let u = ((x as f32 + 0.5 - dst_rect.x) / dst_rect.w).clamp(0.0, 1.0);
+            let sample = if smooth_upscale {
+                sample_bilinear(
+                    texture,
+                    src_x + u * src_w - 0.5,
+                    src_y + v * src_h - 0.5,
+                    source_bounds,
+                )
+            } else {
+                let sx = (src_x + u * src_w)
+                    .floor()
+                    .clamp(0.0, texture.width.saturating_sub(1) as f32) as usize;
+                let sy = (src_y + v * src_h)
+                    .floor()
+                    .clamp(0.0, texture.height.saturating_sub(1) as f32) as usize;
+                let src_index = (sy * texture.width as usize + sx) * 4;
+                [
+                    texture.pixels[src_index],
+                    texture.pixels[src_index + 1],
+                    texture.pixels[src_index + 2],
+                    texture.pixels[src_index + 3],
+                ]
+            };
+            let r = (sample[0] as f32 * tint[0].clamp(0.0, 1.0)) as u8;
+            let g = (sample[1] as f32 * tint[1].clamp(0.0, 1.0)) as u8;
+            let b = (sample[2] as f32 * tint[2].clamp(0.0, 1.0)) as u8;
+            let a = (sample[3] as f32 * tint[3].clamp(0.0, 1.0)) as u8;
             if a == 0 {
                 continue;
             }
@@ -450,6 +473,40 @@ fn draw_textured_rect(
             dst[dst_index] = blend_over(dst[dst_index], r, g, b, a);
         }
     }
+}
+
+/// Bilinear UI sampling in premultiplied alpha avoids dark fringes around
+/// outlined glyphs and transparent button art. Bounds keep neighboring button
+/// animation cells out of the interpolation footprint.
+fn sample_bilinear(texture: &CachedTexture, x: f32, y: f32, bounds: [i32; 4]) -> [u8; 4] {
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+    let mut alpha = 0.0_f32;
+    let mut premul = [0.0_f32; 3];
+    for (ix, wx) in [(x0 as i32, 1.0 - fx), (x0 as i32 + 1, fx)] {
+        for (iy, wy) in [(y0 as i32, 1.0 - fy), (y0 as i32 + 1, fy)] {
+            let sx = ix.clamp(bounds[0], bounds[2]) as usize;
+            let sy = iy.clamp(bounds[1], bounds[3]) as usize;
+            let idx = (sy * texture.width as usize + sx) * 4;
+            let weight = wx * wy;
+            let a = texture.pixels[idx + 3] as f32 * weight;
+            alpha += a;
+            for (channel, value) in premul.iter_mut().enumerate() {
+                *value += texture.pixels[idx + channel] as f32 * a;
+            }
+        }
+    }
+    if alpha <= 0.0 {
+        return [0; 4];
+    }
+    [
+        (premul[0] / alpha).round().clamp(0.0, 255.0) as u8,
+        (premul[1] / alpha).round().clamp(0.0, 255.0) as u8,
+        (premul[2] / alpha).round().clamp(0.0, 255.0) as u8,
+        alpha.round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 fn draw_solid_quad(

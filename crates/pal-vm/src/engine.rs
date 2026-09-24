@@ -355,7 +355,16 @@ impl Engine {
             if button_consumed_mouse_push {
                 if let Some(handle) = runtime.pending_wait_handle() {
                     let _ = self.task_system.free(handle);
-                    runtime.resolve_pending_wait();
+                    if runtime.should_suspend_wait_for_modal() {
+                        // The click opened a modal menu (SAVE/LOAD/SYSTEM)
+                        // while the script was parked at an ADV click wait.
+                        // Suspend the wait instead of resolving it so the
+                        // story does not advance behind the menu; the runtime
+                        // re-parks the wait when the menu's gosub returns.
+                        runtime.suspend_wait_for_modal();
+                    } else {
+                        runtime.resolve_pending_wait();
+                    }
                 }
             } else if runtime.consume_text_reveal_push(&self.input) {
                 if runtime.pending_wait_is_text_reveal() {
@@ -404,7 +413,9 @@ impl Engine {
             }
         }
 
-        // Run script VM.
+        // Run script VM.  The VM sees the same consumed-stripped input as the
+        // task system: a push that triggered a button must not also complete
+        // the work-process ADV click wait behind a modal menu.
         let runtime_tick = match (
             self.runtime.as_mut(),
             self.core_assets.as_ref(),
@@ -417,7 +428,7 @@ impl Engine {
                     Some(&mut self.sprites),
                     Some(&mut self.task_system),
                     Some(&mut self.audio),
-                    Some(&self.input),
+                    Some(input_for_tasks),
                     &self.config.script_runtime,
                 ) {
                     Ok(tick) => Some(tick),
@@ -678,6 +689,7 @@ impl Engine {
                     scene.textures.push(texture.clone());
                     scene.commands.push(DrawCommand::Sprite(SpriteDraw {
                         texture_id: texture.id,
+                        smooth_upscale: false,
                         priority: i32::MAX,
                         dst: RectF::new(
                             shake[0] as f32,

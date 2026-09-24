@@ -12,8 +12,8 @@ use pal_script::{Operand, OperandKind, PointTable, ScriptImage};
 
 use crate::assets::CoreAssets;
 use crate::audio::{
-    audio_lookup_key, decode_game_audio, parse_bgm_csv, AudioHandle, AudioSystem, BgmLoop,
-    PalSoundGroup, PalVolume,
+    audio_lookup_key, decode_game_audio, parse_bgm_csv, AudioConfig, AudioHandle, AudioSystem,
+    BgmLoop, PalSoundGroup, PalVolume,
 };
 use crate::config::{ini_graphics_size, parse_ini_nls, IniFile, IniValue};
 use crate::effect::PalEffectSystem;
@@ -46,6 +46,13 @@ const MAX_FRAME_EVENTS: usize = 64;
 
 fn debug_vm_enabled() -> bool {
     std::env::var("DEBUG_VM")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn debug_memdat_write_enabled() -> bool {
+    std::env::var("DEBUG_MEMDAT_WRITE")
         .ok()
         .as_deref()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -280,9 +287,9 @@ pub struct ScriptRuntime {
     /// mem_dat_words: writable shadow of Mem.dat as i32 words (for MemDatDirect writes).
     mem_dat_words: Vec<i32>,
     /// Portable model for Game.exe category 9 memory_stack_push/pop. Native
-    /// snapshots one 0x4000-byte VM work bank at ctx+715956; it does not restore
-    /// Mem.dat's mutable shadow, which scripts use for menu page requests such
-    /// as memdat[158].
+    /// snapshots one 0x4000-byte VM work bank (ctx+0x1500); it does not restore
+    /// user_mem, system_mem, or Mem.dat's mutable shadow, which scripts use for
+    /// persistent settings and menu page requests such as memdat[158].
     memory_state_stack: Vec<ScriptMemorySnapshot>,
     /// Portable model for category 9 list_stack_push_point/list_stack_pop_count.
     /// Native stores resolved script addresses in a PalList; Rust stores point
@@ -399,6 +406,11 @@ pub struct ScriptRuntime {
     bgm_auto_muted: bool,
     /// `BGM.CSV` sample loop points, loaded once. `None` means not read yet.
     bgm_loops: Option<BTreeMap<String, BgmLoop>>,
+    /// Live category-4 slot state mirrored into save snapshots (version 5).
+    bgm_slots: BTreeMap<i32, BgmSlotState>,
+    /// Set by restore_save_snapshot; the next run_frame replays the restored
+    /// tracks through the audio backend.
+    bgm_replay_pending: bool,
     se_volume_percent: BTreeMap<i32, i32>,
     se_enabled: BTreeMap<i32, bool>,
     se_muted: BTreeMap<i32, bool>,
@@ -431,6 +443,8 @@ pub struct ScriptRuntime {
     frame_events: Vec<FrameEvent>,
     /// Button callback gosub to inject at the top of the next script frame (point ID, not PC).
     pending_gosub_point: Option<u32>,
+    /// ADV click waits parked while a modal menu gosub runs on top of them.
+    modal_wait_suspensions: Vec<ModalWaitSuspension>,
     /// Category 9:23 continuation target.  Unlike button callbacks, this is a
     /// process/menu jump and must not push a return PC or the cleanup routine
     /// returns to the old per-frame wait loop.
@@ -466,8 +480,6 @@ struct ParsedFileTable {
 
 #[derive(Clone, Debug)]
 struct ScriptMemorySnapshot {
-    user_mem: Vec<i32>,
-    system_mem: Vec<i32>,
     temp_mem: Vec<i32>,
 }
 
@@ -840,6 +852,8 @@ const SAVE_SPRITE_CAP: usize = 128;
 const SAVE_SPRITE_BYTES_CAP: usize = 8 * 1024 * 1024;
 const SAVE_MEMDAT_CAP: usize = 65_536;
 const SAVE_NAME_CAP: usize = 256;
+/// BGM slots are a handful in practice; cap the serialized list regardless.
+const SAVE_BGM_TRACK_CAP: usize = 64;
 
 #[derive(Clone, Debug)]
 struct SavedSprite {
@@ -856,6 +870,8 @@ struct SavedSprite {
     rect: [i32; 4],
     width: u32,
     height: u32,
+    native_projection: Option<(f32, f32)>,
+    center_scale: bool,
     rgba: Vec<u8>,
 }
 
@@ -889,6 +905,40 @@ struct SavedButtonGroup {
     onmouse_index: i32,
 }
 
+/// BGM slot state persisted in portable saves (snapshot version 5).  The
+/// original engine serializes its sound wrapper; the portable snapshot keeps
+/// the resolved resource name so a load can reopen and replay the track.
+#[derive(Clone, Debug)]
+struct SavedBgmTrack {
+    slot: i32,
+    name: String,
+    looping: bool,
+    loop_start: i64,
+    loop_end: i64,
+}
+
+/// Live BGM slot bookkeeping mirrored into save snapshots.
+#[derive(Clone, Debug, Default)]
+struct BgmSlotState {
+    name: String,
+    looping: bool,
+    playing: bool,
+    loop_samples: Option<(i64, i64)>,
+}
+
+/// ADV click wait parked while a modal menu gosub (SAVE/LOAD/SYSTEM) runs.
+/// Native Game.exe runs these menus as separate processes on top of the
+/// parked text wait; the portable VM resolves the wait to run the menu, then
+/// re-parks it when the menu's gosub returns so the story does not advance.
+#[derive(Clone, Copy, Debug)]
+struct ModalWaitSuspension {
+    return_pc: u32,
+    call_depth: usize,
+    request: WaitRequest,
+    text_visible: bool,
+    show_wait_mark: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RuntimeSaveSnapshot {
     version: u32,
@@ -920,6 +970,7 @@ struct RuntimeSaveSnapshot {
     sprites: Vec<SavedSprite>,
     buttons: Vec<SavedButton>,
     button_groups: Vec<SavedButtonGroup>,
+    bgm_tracks: Vec<SavedBgmTrack>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1154,6 +1205,8 @@ impl ScriptRuntime {
             bgm_auto_volume_percent: 100,
             bgm_auto_muted: false,
             bgm_loops: None,
+            bgm_slots: BTreeMap::new(),
+            bgm_replay_pending: false,
             se_volume_percent: BTreeMap::new(),
             se_enabled: BTreeMap::new(),
             se_muted: BTreeMap::new(),
@@ -1174,6 +1227,7 @@ impl ScriptRuntime {
             random_state: PalRandomState::default(),
             frame_events: Vec::new(),
             pending_gosub_point: None,
+            modal_wait_suspensions: Vec::new(),
             pending_jump_point: None,
             menu_transition_mode: 0,
             system_scratch_value: 0,
@@ -1251,6 +1305,46 @@ impl ScriptRuntime {
             "[trace-save] loaded portable system data {}",
             path.display()
         );
+        self.load_portable_system_mem(root);
+    }
+
+    /// Load the persisted system_mem bank (global script settings, e.g. the
+    /// SYSTEM screen toggles). The native engine persists its global system
+    /// state into system.dat; sena-rs stores its own portable companion file.
+    fn load_portable_system_mem(&mut self, root: &Path) {
+        let path = portable_system_mem_path(root);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        match decode_portable_system_mem(&bytes) {
+            Ok(words) => {
+                install_i32_words(&mut self.system_mem, &words, DEFAULT_MEM_SIZE);
+                log::debug!(
+                    "[trace-save] loaded portable system mem {} ({} words)",
+                    path.display(),
+                    words.len()
+                );
+            }
+            Err(err) => log::warn!(
+                "[trace-save] ignoring invalid portable system mem {}: {err}",
+                path.display()
+            ),
+        }
+    }
+
+    fn write_portable_system_mem(&self, root: &Path) -> std::io::Result<PathBuf> {
+        let path = portable_system_mem_path(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_portable_system_mem(&self.system_mem);
+        std::fs::write(&path, bytes)?;
+        log::debug!(
+            "[trace-save] wrote portable system mem {} ({} words)",
+            path.display(),
+            self.system_mem.len()
+        );
+        Ok(path)
     }
 
     fn write_portable_system_data(&self, root: &Path) -> std::io::Result<PathBuf> {
@@ -1407,6 +1501,74 @@ impl ScriptRuntime {
                 self.status
             );
         }
+    }
+
+    /// True when a clicked button queued a gosub while the script is parked at
+    /// an ADV click wait.  Native Game.exe runs such menus as separate
+    /// processes on top of the parked wait; resolving the wait to run the menu
+    /// would advance the story, so the engine must route the click through
+    /// `suspend_wait_for_modal` instead of `resolve_pending_wait`.
+    pub fn should_suspend_wait_for_modal(&self) -> bool {
+        self.pending_gosub_point.is_some()
+            && matches!(self.status, RuntimeStatus::WaitClick { .. })
+    }
+
+    /// Parks the current ADV click wait and lets the queued modal gosub run.
+    /// When the gosub returns, `take_modal_wait_repark` re-parks the wait at
+    /// the same PC so the line and its click mark survive the menu round trip.
+    pub fn suspend_wait_for_modal(&mut self) {
+        let RuntimeStatus::WaitClick { pc } = self.status else {
+            return;
+        };
+        let request = self.wait_task_kind.unwrap_or(WaitRequest::Click);
+        self.modal_wait_suspensions.push(ModalWaitSuspension {
+            return_pc: pc,
+            call_depth: self.call_stack.len(),
+            request,
+            text_visible: self.text_state.visible,
+            show_wait_mark: self.text_state.show_wait_mark,
+        });
+        self.wait_task_handle = None;
+        self.wait_task_kind = None;
+        self.status = RuntimeStatus::Running { pc };
+        log::debug!("[trace-wait] suspend_wait_for_modal pc=0x{pc:08X} request={request:?}");
+    }
+
+    /// Called after each executed instruction. When the innermost modal gosub
+    /// has returned to the PC that followed the suspended wait, re-park the
+    /// wait and hand its request back so the engine recreates the wait task.
+    fn take_modal_wait_repark(&mut self) -> Option<WaitRequest> {
+        let susp = self.modal_wait_suspensions.last()?;
+        if self.call_stack.len() > susp.call_depth {
+            return None;
+        }
+        let susp = self.modal_wait_suspensions.pop()?;
+        if self.pc != susp.return_pc || self.call_stack.len() != susp.call_depth {
+            // The modal left through a jump or returned somewhere else; do not
+            // re-park a wait the script no longer sits behind.
+            log::debug!(
+                "[trace-wait] modal repark abandoned pc=0x{:08X} return_pc=0x{:08X}",
+                self.pc,
+                susp.return_pc
+            );
+            return None;
+        }
+        self.text_state.visible = susp.text_visible;
+        self.text_state.show_wait_mark = susp.show_wait_mark;
+        self.text_state.dirty = true;
+        self.wait_task_kind = Some(susp.request);
+        self.status = match susp.request {
+            WaitRequest::Click | WaitRequest::ClickOrTime(_) => {
+                RuntimeStatus::WaitClick { pc: self.pc }
+            }
+            _ => RuntimeStatus::WaitFrame { pc: self.pc },
+        };
+        log::debug!(
+            "[trace-wait] modal repark pc=0x{:08X} request={:?}",
+            self.pc,
+            susp.request
+        );
+        Some(susp.request)
     }
 
     /// Inject the PAL cached frame time used by Game.exe wait-sync wrappers.
@@ -2459,6 +2621,10 @@ impl ScriptRuntime {
         input: Option<&PalInputState>,
         config: &ScriptRuntimeConfig,
     ) -> Result<RuntimeTick, RuntimeError> {
+        // A restored save re-arms its BGM before any wait-state early return,
+        // because a snapshot parked at an ADV click wait would otherwise never
+        // reach the script loop that can see the audio backend.
+        self.replay_restored_bgm(resource_manager.as_deref_mut(), audio.as_deref_mut());
         match self.status {
             RuntimeStatus::Halted { .. }
             | RuntimeStatus::UnsupportedCommand { .. }
@@ -2570,6 +2736,18 @@ impl ScriptRuntime {
             ) {
                 Ok(StepResult::Continue) => {
                     executed += 1;
+                    if let Some(request) = self.take_modal_wait_repark() {
+                        // The modal menu gosub returned to the PC right after
+                        // the suspended ADV click wait; re-park there instead
+                        // of letting the script run on to the next line.
+                        let events = std::mem::take(&mut self.frame_events);
+                        return Ok(RuntimeTick {
+                            executed,
+                            status: self.status.clone(),
+                            wait_request: Some(request),
+                            frame_events: events,
+                        });
+                    }
                 }
                 Ok(StepResult::Blocked) => {
                     executed += 1;
@@ -3434,6 +3612,17 @@ impl ScriptRuntime {
         if word_index >= self.mem_dat_words.len() {
             self.mem_dat_words.resize(word_index + 1, 0);
         }
+        let old = self.mem_dat_words[word_index];
+        if old != value && debug_memdat_write_enabled() {
+            log::debug!(
+                "[trace-memdat] write word[{}] (memdat[{}]) {:08X} -> {:08X} pc=0x{:08X}",
+                word_index,
+                word_index.wrapping_sub(4),
+                old as u32,
+                value as u32,
+                self.pc
+            );
+        }
         self.mem_dat_words[word_index] = value;
     }
 
@@ -4204,15 +4393,15 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(self.system_state.window_mode_cache())
             }
             21 => {
-                // Game.exe sub_437E10 snapshots only ctx+715956..+732339 onto a
-                // 32-entry memory stack. Do not include Mem.dat shadow state:
-                // menu dispatch writes memdat[158] before popping this stack,
-                // and native keeps that request alive for the outer dispatcher.
+                // Game.exe memory_stack_push snapshots one 0x4000-byte task work
+                // bank (ctx+0x1500) onto a 32-entry stack. user_mem/system_mem
+                // live outside that range (ctx+0x22F40/+0x27F40) and must NOT be
+                // rolled back on pop: menu handlers store persistent settings
+                // there (e.g. the SYSTEM screen's mem_system[0] initialized flag
+                // and its toggle values). memdat[158] page requests also survive.
                 self.pop_ext_args(0);
                 if self.memory_state_stack.len() < 32 {
                     self.memory_state_stack.push(ScriptMemorySnapshot {
-                        user_mem: self.user_mem.clone(),
-                        system_mem: self.system_mem.clone(),
                         temp_mem: self.temp_mem.clone(),
                     });
                 } else {
@@ -4221,13 +4410,10 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             22 => {
-                // Game.exe sub_437D90 restores the latest ctx+715956 work-bank
-                // snapshot. The PAL Mem.dat area is outside that copy range, so
-                // portable mem_dat_words must survive this pop as well.
+                // Restores only the pushed work-bank snapshot; user_mem,
+                // system_mem, and the Mem.dat shadow keep their current values.
                 self.pop_ext_args(0);
                 if let Some(snapshot) = self.memory_state_stack.pop() {
-                    self.user_mem = snapshot.user_mem;
-                    self.system_mem = snapshot.system_mem;
                     self.temp_mem = snapshot.temp_mem;
                 } else {
                     log::warn!("[trace-system] memory_stack_pop underflow");
@@ -5473,6 +5659,13 @@ impl ScriptRuntime {
                 if let Some(manager) = resource_manager.as_deref() {
                     if let Err(err) = self.write_portable_system_data(manager.root()) {
                         log::warn!("[trace-save] savesystemdata failed: {err}");
+                        return ExtCallOutcome::Value(0);
+                    }
+                    // The native engine also persists its global system state
+                    // (system.dat) here; sena-rs writes the system_mem bank that
+                    // holds the script-side global settings.
+                    if let Err(err) = self.write_portable_system_mem(manager.root()) {
+                        log::warn!("[trace-save] savesystemdata system_mem failed: {err}");
                         return ExtCallOutcome::Value(0);
                     }
                 }
@@ -7599,6 +7792,7 @@ impl ScriptRuntime {
         };
         desc.visible = entry_flag != 0;
         desc.base_priority = BUTTON_RENDER_PRIORITY;
+        desc.smooth_upscale = true;
         desc.source_name = source_name.clone();
         let handle = sprites.create(desc);
         if let Some((asset_name, bytes)) = pending_button_animation {
@@ -11858,7 +12052,7 @@ impl ScriptRuntime {
 
     fn capture_save_snapshot(&self) -> RuntimeSaveSnapshot {
         RuntimeSaveSnapshot {
-            version: 4,
+            version: 6,
             pc: self.pc,
             call_stack: self.call_stack.clone(),
             user_mem: bounded_i32_copy(&self.user_mem, DEFAULT_MEM_SIZE),
@@ -11887,7 +12081,23 @@ impl ScriptRuntime {
             sprites: Vec::new(),
             buttons: Vec::new(),
             button_groups: Vec::new(),
+            bgm_tracks: self.playing_bgm_tracks(),
         }
+    }
+
+    /// BGM slots currently playing, flattened for the portable snapshot.
+    fn playing_bgm_tracks(&self) -> Vec<SavedBgmTrack> {
+        self.bgm_slots
+            .iter()
+            .filter(|(_, state)| state.playing && !state.name.is_empty())
+            .map(|(&slot, state)| SavedBgmTrack {
+                slot,
+                name: state.name.chars().take(SAVE_NAME_CAP).collect(),
+                looping: state.looping,
+                loop_start: state.loop_samples.map(|(start, _)| start).unwrap_or(-1),
+                loop_end: state.loop_samples.map(|(_, end)| end).unwrap_or(-1),
+            })
+            .collect()
     }
 
     fn capture_save_checkpoint(
@@ -12052,6 +12262,10 @@ impl ScriptRuntime {
         snapshot.sprites = Vec::new();
         snapshot.buttons = Vec::new();
         snapshot.button_groups = Vec::new();
+        // The native image does store a sound wrapper, but its layout is not
+        // mapped yet; the tracks captured from the menu runtime (e.g. title
+        // BGM) would be wrong for the restored scene, so drop them.
+        snapshot.bgm_tracks = Vec::new();
         if text_value != 0 {
             snapshot.text_args = [0, text_value, 0x0FFF_FFFF, 0x0FFF_FFFF];
             snapshot.text_visible = true;
@@ -12092,6 +12306,28 @@ impl ScriptRuntime {
         self.effect_system.stop_selected(0x1d);
         self.wait_time_stack.clear();
         self.adv_wait_checkpoint_pending = false;
+        self.modal_wait_suspensions.clear();
+        if snapshot.version >= 5 {
+            self.bgm_slots = snapshot
+                .bgm_tracks
+                .iter()
+                .map(|track| {
+                    (
+                        track.slot,
+                        BgmSlotState {
+                            name: track.name.clone(),
+                            looping: track.looping,
+                            playing: true,
+                            loop_samples: (track.loop_start >= 0 && track.loop_end >= 0)
+                                .then_some((track.loop_start, track.loop_end)),
+                        },
+                    )
+                })
+                .collect();
+            // Replay runs even with an empty track list so the outgoing
+            // scene's BGM does not keep playing under the restored one.
+            self.bgm_replay_pending = true;
+        }
         self.status = RuntimeStatus::Running { pc: self.pc };
     }
 
@@ -12115,6 +12351,10 @@ impl ScriptRuntime {
             let _ = sprites.set_scale(handle, f32::from_bits(record.scale_bits));
             let _ = sprites.set_color(handle, PalColor(record.color));
             let _ = sprites.view_ctrl(handle, record.visible);
+            let _ = sprites.set_native_projection(handle, record.native_projection);
+            if let Some(sprite) = sprites.get_mut(handle) {
+                sprite.center_scale = record.center_scale;
+            }
             let _ = sprites.set_rect(
                 handle,
                 Some(PalRect::new(
@@ -12337,6 +12577,10 @@ impl ScriptRuntime {
         if let (Some(handle), Some(audio)) = (self.game_audio.get(&(4, slot)).copied(), audio) {
             let looping = (flags & 1) != 0;
             let _ = audio.play(handle, looping);
+            if let Some(state) = self.bgm_slots.get_mut(&slot) {
+                state.playing = true;
+                state.looping = looping;
+            }
         }
         ExtCallOutcome::Value(slot)
     }
@@ -12650,8 +12894,14 @@ impl ScriptRuntime {
                 }
             }
             let _ = audio.release_group(group);
+            if category == 4 {
+                self.bgm_slots.clear();
+            }
         } else if let Some(handle) = self.game_audio.remove(&(category, slot)) {
             let _ = audio.release(handle);
+            if category == 4 {
+                self.bgm_slots.remove(&slot);
+            }
         }
         ExtCallOutcome::Value(1)
     }
@@ -12748,17 +12998,56 @@ impl ScriptRuntime {
             );
             return ExtCallOutcome::Value(slot);
         }
+        if self.load_named_audio(
+            category,
+            slot,
+            group,
+            &name,
+            flags,
+            volume_percent,
+            play,
+            loop_samples,
+            resource_manager,
+            audio,
+        ) {
+            ExtCallOutcome::Value(slot)
+        } else {
+            ExtCallOutcome::Value(0)
+        }
+    }
+
+    /// Loads a resolved resource name into `(category, slot)` and optionally
+    /// plays it. Returns false when the resource or audio backend failed;
+    /// category-4 slots mirror the outcome into `bgm_slots` for save snapshots.
+    #[allow(clippy::too_many_arguments)]
+    fn load_named_audio(
+        &mut self,
+        category: u16,
+        slot: i32,
+        group: PalSoundGroup,
+        name: &str,
+        flags: i32,
+        volume_percent: i32,
+        play: bool,
+        loop_samples: Option<(i64, i64)>,
+        resource_manager: Option<&mut ResourceManager>,
+        audio: Option<&mut AudioSystem>,
+    ) -> bool {
         let (Some(resource_manager), Some(audio)) = (resource_manager, audio) else {
-            return ExtCallOutcome::Value(0);
+            return false;
         };
         if let Some(old) = self.game_audio.remove(&(category, slot)) {
             let _ = audio.release(old);
         }
-        let asset = match open_resource_variant(resource_manager, &name, AUDIO_EXTENSIONS) {
+        if category == 4 {
+            // The slot's previous track is gone even if the new load fails.
+            self.bgm_slots.remove(&slot);
+        }
+        let asset = match open_resource_variant(resource_manager, name, AUDIO_EXTENSIONS) {
             Ok(asset) => asset,
             Err(err) => {
                 log::warn!("[trace-audio] open category={category} slot={slot} name={name:?} failed: {err}");
-                return ExtCallOutcome::Value(0);
+                return false;
             }
         };
         let decoded = decode_game_audio(&asset.bytes, &mut |member| {
@@ -12772,7 +13061,7 @@ impl ScriptRuntime {
                     "[trace-audio] decode category={category} slot={slot} asset={:?} failed: {err}",
                     asset.name
                 );
-                return ExtCallOutcome::Value(0);
+                return false;
             }
         };
         let handle = match audio.load_static_data(asset.name.clone(), data, group) {
@@ -12782,7 +13071,7 @@ impl ScriptRuntime {
                     "[trace-audio] load category={category} slot={slot} asset={:?} failed: {err}",
                     asset.name
                 );
-                return ExtCallOutcome::Value(0);
+                return false;
             }
         };
         if let Some((start, end)) = loop_samples {
@@ -12805,6 +13094,17 @@ impl ScriptRuntime {
             }
         }
         self.game_audio.insert((category, slot), handle);
+        if category == 4 {
+            self.bgm_slots.insert(
+                slot,
+                BgmSlotState {
+                    name: name.to_owned(),
+                    looping: (flags & 1) != 0,
+                    playing: play,
+                    loop_samples,
+                },
+            );
+        }
         log::debug!(
             "[trace-audio] category={category} slot={slot} asset={:?} group={:?} channel_raw={} effective_raw={} play={play} flags=0x{flags:08X}",
             asset.name,
@@ -12812,7 +13112,62 @@ impl ScriptRuntime {
             volume.raw(),
             effective_volume
         );
-        ExtCallOutcome::Value(slot)
+        true
+    }
+
+    /// Replays the BGM slots carried by a restored save snapshot (version 5).
+    /// The outgoing scene's category-4 channels are released first so a title
+    /// or menu track does not keep playing under the restored scene.  Runs at
+    /// the top of the next frame after `load`, where the audio backend is
+    /// reachable regardless of the restored wait state.
+    fn replay_restored_bgm(
+        &mut self,
+        mut resource_manager: Option<&mut ResourceManager>,
+        mut audio: Option<&mut AudioSystem>,
+    ) {
+        if !self.bgm_replay_pending {
+            return;
+        }
+        self.bgm_replay_pending = false;
+        let old_keys = self
+            .game_audio
+            .keys()
+            .filter(|(category, _)| *category == 4)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in old_keys {
+            if let Some(handle) = self.game_audio.remove(&key) {
+                if let Some(audio) = audio.as_deref_mut() {
+                    let _ = audio.release(handle);
+                }
+            }
+        }
+        let tracks = self
+            .bgm_slots
+            .iter()
+            .filter(|(_, state)| state.playing)
+            .map(|(&slot, state)| (slot, state.name.clone(), state.looping, state.loop_samples))
+            .collect::<Vec<_>>();
+        for (slot, name, looping, loop_samples) in tracks {
+            let flags = i32::from(looping);
+            let loaded = self.load_named_audio(
+                4,
+                slot,
+                PalSoundGroup::GROUP3,
+                &name,
+                flags,
+                100,
+                true,
+                loop_samples,
+                resource_manager.as_deref_mut(),
+                audio.as_deref_mut(),
+            );
+            if loaded {
+                log::debug!("[trace-audio] restored bgm slot={slot} name={name:?}");
+            } else {
+                log::warn!("[trace-audio] restored bgm slot={slot} name={name:?} failed");
+            }
+        }
     }
 
     fn next_free_audio_slot(&self, category: u16, limit: i32) -> i32 {
@@ -14604,10 +14959,58 @@ fn portable_system_data_path(root: &Path) -> PathBuf {
     portable_save_dir(root).join("system.ini")
 }
 
+fn portable_system_mem_path(root: &Path) -> PathBuf {
+    portable_save_dir(root).join("system_mem.bin")
+}
+
+const PORTABLE_SYSTEM_MEM_MAGIC: &[u8; 8] = b"SENARMEM";
+const PORTABLE_SYSTEM_MEM_VERSION: u32 = 1;
+
+fn encode_portable_system_mem(words: &[i32]) -> Vec<u8> {
+    // Trim trailing zeros so the file stays small; zeros are the default state.
+    let count = words.iter().rposition(|value| *value != 0).map_or(0, |i| i + 1);
+    let mut bytes = Vec::with_capacity(12 + count * 4);
+    bytes.extend_from_slice(PORTABLE_SYSTEM_MEM_MAGIC);
+    bytes.extend_from_slice(&PORTABLE_SYSTEM_MEM_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(count as u32).to_le_bytes());
+    for value in &words[..count] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_portable_system_mem(bytes: &[u8]) -> std::io::Result<Vec<i32>> {
+    if bytes.len() < 12 || &bytes[..8] != PORTABLE_SYSTEM_MEM_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad SENARMEM header",
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != PORTABLE_SYSTEM_MEM_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported SENARMEM version {version}"),
+        ));
+    }
+    let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    if bytes.len() < 16 + count * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated SENARMEM body",
+        ));
+    }
+    let mut words = Vec::with_capacity(count);
+    for chunk in bytes[16..16 + count * 4].chunks_exact(4) {
+        words.push(i32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(words)
+}
+
 fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"SENARSAV");
-    write_u32(&mut bytes, 4)?;
+    write_u32(&mut bytes, 6)?;
     write_u32(&mut bytes, snapshot.pc)?;
     write_u32_vec(&mut bytes, &snapshot.call_stack)?;
     write_i32_vec(
@@ -14675,6 +15078,17 @@ fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Resu
         write_i32(&mut bytes, group.onmouse_index)?;
     }
     bytes.write_all(&[u8::from(snapshot.resume_wait_click)])?;
+    write_u32(
+        &mut bytes,
+        snapshot.bgm_tracks.len().min(SAVE_BGM_TRACK_CAP) as u32,
+    )?;
+    for track in snapshot.bgm_tracks.iter().take(SAVE_BGM_TRACK_CAP) {
+        write_i32(&mut bytes, track.slot)?;
+        write_bytes(&mut bytes, track.name.as_bytes(), SAVE_NAME_CAP)?;
+        bytes.write_all(&[u8::from(track.looping)])?;
+        write_i64(&mut bytes, track.loop_start)?;
+        write_i64(&mut bytes, track.loop_end)?;
+    }
     Ok(bytes)
 }
 
@@ -14759,7 +15173,7 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
         ));
     }
     let version = read_u32_from(reader)?;
-    if !(1..=4).contains(&version) {
+    if !(1..=6).contains(&version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported portable save version",
@@ -14828,7 +15242,7 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
         snapshot.thumb_width = read_i32_from(reader)?;
         snapshot.thumb_height = read_i32_from(reader)?;
         snapshot.thumb_pixels = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
-        snapshot.sprites = read_saved_sprites(reader)?;
+        snapshot.sprites = read_saved_sprites(reader, version)?;
         snapshot.buttons = read_saved_buttons(reader, version)?;
         let group_len = read_u32_from(reader)? as usize;
         if group_len > SAVE_SPRITE_CAP {
@@ -14849,6 +15263,31 @@ fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<Runti
             reader.read_exact(&mut flag)?;
             snapshot.resume_wait_click = flag[0] != 0;
         }
+        if version >= 5 {
+            let bgm_len = read_u32_from(reader)? as usize;
+            if bgm_len > SAVE_BGM_TRACK_CAP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "save bgm track list is too large",
+                ));
+            }
+            for _ in 0..bgm_len {
+                let slot = read_i32_from(reader)?;
+                let name_bytes = read_bytes_capped(reader, SAVE_NAME_CAP)?;
+                let name = String::from_utf8_lossy(&name_bytes).into_owned();
+                reader.read_exact(&mut flag)?;
+                let looping = flag[0] != 0;
+                let loop_start = read_i64_from(reader)?;
+                let loop_end = read_i64_from(reader)?;
+                snapshot.bgm_tracks.push(SavedBgmTrack {
+                    slot,
+                    name,
+                    looping,
+                    loop_start,
+                    loop_end,
+                });
+            }
+        }
     }
     Ok(snapshot)
 }
@@ -14858,6 +15297,10 @@ fn write_i32(out: &mut Vec<u8>, value: i32) -> std::io::Result<()> {
 }
 
 fn write_u32(out: &mut Vec<u8>, value: u32) -> std::io::Result<()> {
+    out.write_all(&value.to_le_bytes())
+}
+
+fn write_i64(out: &mut Vec<u8>, value: i64) -> std::io::Result<()> {
     out.write_all(&value.to_le_bytes())
 }
 
@@ -14910,6 +15353,10 @@ fn write_saved_sprites(out: &mut Vec<u8>, sprites: &[SavedSprite]) -> std::io::R
         }
         write_u32(out, sprite.width)?;
         write_u32(out, sprite.height)?;
+        let (project_x, project_y) = sprite.native_projection.unwrap_or((-1.0, -1.0));
+        write_u32(out, project_x.to_bits())?;
+        write_u32(out, project_y.to_bits())?;
+        out.write_all(&[u8::from(sprite.center_scale)])?;
         write_bytes(out, &sprite.rgba, SAVE_SPRITE_BYTES_CAP)?;
     }
     Ok(())
@@ -14957,6 +15404,12 @@ fn read_u32_from(reader: &mut impl Read) -> std::io::Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn read_i64_from(reader: &mut impl Read) -> std::io::Result<i64> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(i64::from_le_bytes(bytes))
+}
+
 fn read_i32_vec_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<i32>> {
     let len = read_u32_from(reader)? as usize;
     if len > cap {
@@ -15000,7 +15453,7 @@ fn read_bytes_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<
     Ok(bytes)
 }
 
-fn read_saved_sprites(reader: &mut impl Read) -> std::io::Result<Vec<SavedSprite>> {
+fn read_saved_sprites(reader: &mut impl Read, version: u32) -> std::io::Result<Vec<SavedSprite>> {
     let len = read_u32_from(reader)? as usize;
     if len > SAVE_SPRITE_CAP {
         return Err(std::io::Error::new(
@@ -15027,6 +15480,16 @@ fn read_saved_sprites(reader: &mut impl Read) -> std::io::Result<Vec<SavedSprite
         }
         let width = read_u32_from(reader)?;
         let height = read_u32_from(reader)?;
+        let (native_projection, center_scale) = if version >= 6 {
+            let project_x = f32::from_bits(read_u32_from(reader)?);
+            let project_y = f32::from_bits(read_u32_from(reader)?);
+            let mut center = [0_u8; 1];
+            reader.read_exact(&mut center)?;
+            let projection = (project_x >= 0.0 && project_y >= 0.0).then_some((project_x, project_y));
+            (projection, center[0] != 0)
+        } else {
+            (None, false)
+        };
         let rgba = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
         sprites.push(SavedSprite {
             slot,
@@ -15042,6 +15505,8 @@ fn read_saved_sprites(reader: &mut impl Read) -> std::io::Result<Vec<SavedSprite
             rect,
             width,
             height,
+            native_projection,
+            center_scale,
             rgba,
         });
     }
@@ -15161,6 +15626,8 @@ fn saved_sprite_from_handle(
         ],
         width: texture.width,
         height: texture.height,
+        native_projection: sprite.native_projection,
+        center_scale: sprite.center_scale,
         rgba: texture.pixels[..expected].to_vec(),
     })
 }
@@ -16411,6 +16878,31 @@ mod tests {
             vars: vec![21, 22],
             argument_base: 64,
             title_bytes: b"line".to_vec(),
+            bgm_tracks: vec![SavedBgmTrack {
+                slot: 0,
+                name: "bgm01".to_owned(),
+                looping: true,
+                loop_start: 1000,
+                loop_end: 2000,
+            }],
+            sprites: vec![SavedSprite {
+                slot: 7,
+                x: 640,
+                y: 360,
+                z: 0,
+                offset_x: 0,
+                offset_y: 0,
+                priority: 10,
+                scale_bits: 1.5_f32.to_bits(),
+                color: 0xFFFF_FFFF,
+                visible: true,
+                rect: [0, 0, 4, 4],
+                width: 4,
+                height: 4,
+                native_projection: Some((0.5, 0.25)),
+                center_scale: true,
+                rgba: vec![0xAB; 4 * 4 * 4],
+            }],
             ..RuntimeSaveSnapshot::default()
         };
 
@@ -16434,10 +16926,26 @@ mod tests {
         assert_eq!(restored.vars, snapshot.vars);
         assert_eq!(restored.argument_base, 64);
         assert_eq!(restored.title_bytes, b"line");
-        assert_eq!(restored.version, 4);
+        assert_eq!(restored.version, 6);
         assert!(restored.resume_wait_click);
+        assert_eq!(restored.sprites.len(), 1);
+        let sprite = &restored.sprites[0];
+        assert_eq!(sprite.slot, 7);
+        assert_eq!(sprite.native_projection, Some((0.5, 0.25)));
+        assert!(sprite.center_scale);
+        assert_eq!(sprite.scale_bits, 1.5_f32.to_bits());
+        assert_eq!(restored.bgm_tracks.len(), 1);
+        let track = &restored.bgm_tracks[0];
+        assert_eq!(track.slot, 0);
+        assert_eq!(track.name, "bgm01");
+        assert!(track.looping);
+        assert_eq!((track.loop_start, track.loop_end), (1000, 2000));
 
-        let mut older_bytes = encode_runtime_save_snapshot(&snapshot).expect("encode v4");
+        let v2_snapshot = RuntimeSaveSnapshot {
+            pc: snapshot.pc,
+            ..RuntimeSaveSnapshot::default()
+        };
+        let mut older_bytes = encode_runtime_save_snapshot(&v2_snapshot).expect("encode v6");
         older_bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
         older_bytes.pop();
         let older = decode_runtime_save_snapshot(&mut older_bytes.as_slice()).expect("read v2");
@@ -16445,6 +16953,48 @@ mod tests {
         assert!(!older.resume_wait_click);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modal_menu_suspends_and_reparks_adv_click_wait() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.status = RuntimeStatus::WaitClick { pc: 0x2000 };
+        runtime.wait_task_kind = Some(WaitRequest::Click);
+        runtime.pending_gosub_point = Some(7);
+        runtime.text_state.visible = true;
+        runtime.text_state.show_wait_mark = true;
+        assert!(runtime.should_suspend_wait_for_modal());
+
+        runtime.suspend_wait_for_modal();
+        assert!(matches!(runtime.status, RuntimeStatus::Running { pc: 0x2000 }));
+        assert_eq!(runtime.modal_wait_suspensions.len(), 1);
+
+        // The engine injects the menu gosub: push the parked PC and jump.
+        runtime.call_stack.push(0x2000);
+        runtime.pc = 0x9000;
+        // Still inside the modal; no re-park yet.
+        assert!(runtime.take_modal_wait_repark().is_none());
+        // The menu returns to the PC after the suspended wait instruction.
+        runtime.pc = runtime.call_stack.pop().unwrap();
+        assert_eq!(
+            runtime.take_modal_wait_repark(),
+            Some(WaitRequest::Click),
+            "the ADV click wait must be re-parked after the modal returns"
+        );
+        assert!(matches!(runtime.status, RuntimeStatus::WaitClick { pc: 0x2000 }));
+        assert!(runtime.text_state.visible);
+        assert!(runtime.text_state.show_wait_mark);
+        assert!(runtime.modal_wait_suspensions.is_empty());
+
+        // A modal that exits through a different path must not re-park.
+        runtime.status = RuntimeStatus::WaitClick { pc: 0x3000 };
+        runtime.wait_task_kind = Some(WaitRequest::Click);
+        runtime.pending_gosub_point = Some(8);
+        runtime.suspend_wait_for_modal();
+        runtime.pc = 0x4560;
+        assert_eq!(runtime.take_modal_wait_repark(), None);
+        assert!(runtime.modal_wait_suspensions.is_empty());
+        assert!(matches!(runtime.status, RuntimeStatus::Running { .. }));
     }
 
     #[test]
@@ -16678,6 +17228,45 @@ mod tests {
         assert!(runtime.save_state.thumbnail_sprites.is_empty());
         assert!(!runtime.effect_system.active());
         assert!(runtime.game_sprite_transitions.is_empty());
+    }
+
+    #[test]
+    fn restored_scene_keeps_native_projection_and_center_scale() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let standing = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(960, 540, 0),
+                10,
+                "ST01A_A",
+            )
+            .unwrap();
+        let _ = sprites.set_native_projection(standing, Some((2.0 / 3.0, 2.0 / 3.0)));
+        let _ = sprites.set_scale(standing, 0.8);
+        if let Some(sprite) = sprites.get_mut(standing) {
+            sprite.center_scale = true;
+        }
+        runtime.game_sprites.insert(3, standing);
+        let snapshot = runtime.capture_resumable_scene(Some(&sprites));
+        assert_eq!(snapshot.sprites.len(), 1);
+        assert_eq!(
+            snapshot.sprites[0].native_projection,
+            Some((2.0 / 3.0, 2.0 / 3.0))
+        );
+        assert!(snapshot.sprites[0].center_scale);
+
+        runtime.restore_save_snapshot(snapshot.clone());
+        runtime.restore_checkpoint_scene(&snapshot, &mut sprites);
+        let restored_handle = runtime.game_sprites[&3];
+        let restored = sprites.get(restored_handle).expect("restored sprite");
+        assert_eq!(restored.native_projection, Some((2.0 / 3.0, 2.0 / 3.0)));
+        assert!(restored.center_scale);
+        assert_eq!(restored.position.x, 960.0);
+        assert_eq!(restored.position.y, 540.0);
+        assert!((restored.scale - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -16974,5 +17563,147 @@ mod tests {
             }
         }
         assert!(advanced, "resume should continue into the next line");
+    }
+
+    /// Real-game fixture: a save snapshot records the playing BGM and a restore
+    /// stops the outgoing scene's track before replaying the saved one.
+    ///
+    /// `testcase/` must be a koikake game root; needs a working audio device.
+    #[test]
+    #[ignore = "needs a local koikake game root at testcase/ and an audio device"]
+    fn restored_save_replays_bgm_and_stops_the_outgoing_track() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testcase");
+        let mut resource_manager =
+            ResourceManager::bootstrap(&root, Nls::ShiftJis).expect("game root");
+        let assets = CoreAssets::load(&mut resource_manager, None).expect("core assets");
+        let mut audio = AudioSystem::new(AudioConfig::default()).expect("audio system");
+        if !audio.is_enabled() {
+            eprintln!("audio device unavailable; skipping bgm replay fixture");
+            return;
+        }
+        let mut runtime = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        assert!(runtime.load_named_audio(
+            4,
+            0,
+            PalSoundGroup::GROUP3,
+            "BGM01",
+            1,
+            100,
+            true,
+            None,
+            Some(&mut resource_manager),
+            Some(&mut audio),
+        ));
+        let saved_handle = runtime.game_audio[&(4, 0)];
+        assert!(audio.is_playing(saved_handle).unwrap_or(false));
+        let snapshot = runtime.capture_save_snapshot();
+        assert_eq!(snapshot.bgm_tracks.len(), 1);
+        assert_eq!(snapshot.bgm_tracks[0].slot, 0);
+        assert_eq!(snapshot.bgm_tracks[0].name, "BGM01");
+        assert!(snapshot.bgm_tracks[0].looping);
+        let bytes = encode_runtime_save_snapshot(&snapshot).expect("encode v5");
+        let decoded =
+            decode_runtime_save_snapshot(&mut bytes.as_slice()).expect("decode v5");
+        assert_eq!(decoded.bgm_tracks.len(), 1);
+        assert_eq!(decoded.bgm_tracks[0].name, "BGM01");
+        // The saving session is over; its channels do not share the audio
+        // backend with the loading session.
+        audio.release(saved_handle).expect("release saved track");
+
+        // The runtime that loads the save is playing a different track.  Audio
+        // handles are slot ids, so prove the release through the slot's loop
+        // region instead: it survives a stale slot but not release+reload.
+        let mut restored = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        assert!(restored.load_named_audio(
+            4,
+            1,
+            PalSoundGroup::GROUP3,
+            "BGM16",
+            1,
+            100,
+            true,
+            None,
+            Some(&mut resource_manager),
+            Some(&mut audio),
+        ));
+        let outgoing_handle = restored.game_audio[&(4, 1)];
+        audio
+            .set_loop_samples(outgoing_handle, 123, 456)
+            .expect("mark outgoing track");
+
+        restored.restore_save_snapshot(decoded);
+        assert!(restored.bgm_replay_pending);
+        restored.replay_restored_bgm(Some(&mut resource_manager), Some(&mut audio));
+        assert!(!restored.bgm_replay_pending);
+        assert!(
+            !restored.game_audio.contains_key(&(4, 1)),
+            "the outgoing scene's script slot must be released by the restore replay"
+        );
+        let restored_handle = restored.game_audio[&(4, 0)];
+        assert_eq!(
+            restored.bgm_slots.get(&0).map(|state| state.name.as_str()),
+            Some("BGM01")
+        );
+        assert!(
+            audio.is_playing(restored_handle).unwrap_or(false),
+            "the saved BGM must be playing after the restore replay"
+        );
+        assert_ne!(
+            audio.loop_samples(restored_handle).ok(),
+            Some((123, 456)),
+            "the reused channel must come from a fresh load, not the outgoing track"
+        );
+
+        // Full round trip through the script-facing save/load extcalls: the
+        // written save file must carry the BGM track and a load must re-arm
+        // the replay.  Slot 777 keeps the file away from real save pages.
+        let slot = 777;
+        runtime.save_state.armed = true;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.stack.push(0);
+        runtime.stack.push(slot);
+        let outcome = runtime.dispatch_save_stub(
+            0,
+            &assets,
+            Nls::ShiftJis,
+            Some(&mut resource_manager),
+            None,
+        );
+        assert!(matches!(outcome, ExtCallOutcome::Value(1)));
+
+        let mut loaded = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        loaded.stack.push(slot);
+        let outcome = loaded.dispatch_save_stub(
+            1,
+            &assets,
+            Nls::ShiftJis,
+            Some(&mut resource_manager),
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            ExtCallOutcome::Value(1) | ExtCallOutcome::Wait { .. }
+        ));
+        assert!(loaded.bgm_replay_pending);
+        assert_eq!(
+            loaded.bgm_slots.get(&0).map(|state| state.name.as_str()),
+            Some("BGM01")
+        );
+        loaded.replay_restored_bgm(Some(&mut resource_manager), Some(&mut audio));
+        let loaded_handle = loaded.game_audio[&(4, 0)];
+        assert!(
+            audio.is_playing(loaded_handle).unwrap_or(false),
+            "the extcall-loaded save must replay its BGM"
+        );
+        let _ = std::fs::remove_file(original_save_path(&root, slot));
     }
 }

@@ -110,6 +110,7 @@ impl SpriteSystem {
         desc.position = position;
         desc.base_priority = priority;
         desc.visible = true;
+        desc.smooth_upscale = true;
         desc.source_name = source_name.into();
         Some(self.create(desc))
     }
@@ -1423,6 +1424,7 @@ pub struct SpriteDesc {
     pub info_extra: u32,
     pub source_name: String,
     pub native_projection: Option<(f32, f32)>,
+    pub smooth_upscale: bool,
 }
 
 impl SpriteDesc {
@@ -1449,6 +1451,7 @@ impl SpriteDesc {
             info_extra: 0,
             source_name: String::new(),
             native_projection: None,
+            smooth_upscale: false,
         }
     }
 }
@@ -1480,6 +1483,7 @@ pub struct PalSprite {
     pub info_extra: u32,
     pub source_name: String,
     pub native_projection: Option<(f32, f32)>,
+    pub smooth_upscale: bool,
 }
 
 impl PalSprite {
@@ -1515,6 +1519,7 @@ impl PalSprite {
             info_extra: desc.info_extra,
             source_name: desc.source_name,
             native_projection: desc.native_projection,
+            smooth_upscale: desc.smooth_upscale,
         }
     }
 
@@ -1535,6 +1540,7 @@ impl PalSprite {
             extra: self.info_extra,
             source_name: self.source_name.clone(),
             native_projection: self.native_projection,
+            smooth_upscale: self.smooth_upscale,
         }
     }
 
@@ -1554,6 +1560,7 @@ impl PalSprite {
         self.info_extra = info.extra;
         self.source_name = info.source_name;
         self.native_projection = info.native_projection;
+        self.smooth_upscale = info.smooth_upscale;
     }
 
     pub fn frame_count(&self, axis: PalAnimationAxis) -> u16 {
@@ -1714,6 +1721,7 @@ impl PalSprite {
         );
         Some(DrawCommand::Sprite(SpriteDraw {
             texture_id: surface.texture_id,
+            smooth_upscale: self.smooth_upscale,
             priority: self.effective_priority(),
             dst,
             src,
@@ -1846,6 +1854,7 @@ pub struct PalSpriteInfo {
     pub extra: u32,
     pub source_name: String,
     pub native_projection: Option<(f32, f32)>,
+    pub smooth_upscale: bool,
 }
 
 #[derive(Clone, Debug)]
