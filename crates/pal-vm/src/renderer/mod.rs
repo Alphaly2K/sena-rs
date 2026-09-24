@@ -9,13 +9,15 @@ use winit::event_loop::OwnedDisplayHandle;
 use winit::window::Window;
 
 use crate::scene::{
-    DrawCommand, FrameScene, RectF, SceneTexture, SceneTextureFormat, SceneTextureId, SolidQuad,
-    SpriteDraw,
+    rasterize_scene_rgba, DrawCommand, FrameScene, RectF, SceneTexture, SceneTextureFormat,
+    SceneTextureId, SolidQuad, SpriteDraw,
 };
 
 mod shader;
+mod wgpu_backend;
 
 pub use shader::{shader_source, ShaderProgram};
+use wgpu_backend::WgpuBackend;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RendererConfig {
@@ -48,13 +50,22 @@ pub enum RenderOutcome {
 
 pub struct Renderer {
     window: Arc<Window>,
-    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    backend: Backend,
     size: PhysicalSize<u32>,
     virtual_size: PhysicalSize<u32>,
     clear_color: wgpu::Color,
-    scene_textures: HashMap<SceneTextureId, CachedTexture>,
     frame_dump_path: Option<String>,
     frame_dump_written: bool,
+}
+
+enum Backend {
+    Software(SoftwareBackend),
+    Wgpu(WgpuBackend),
+}
+
+struct SoftwareBackend {
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    scene_textures: HashMap<SceneTextureId, CachedTexture>,
 }
 
 impl Renderer {
@@ -64,6 +75,35 @@ impl Renderer {
         renderer_config: RendererConfig,
     ) -> anyhow::Result<Self> {
         let size = nonzero_size(window.inner_size());
+        let virtual_size = PhysicalSize::new(
+            renderer_config.virtual_width.max(1),
+            renderer_config.virtual_height.max(1),
+        );
+        let frame_dump_path = std::env::var("PAL_RENDER_DUMP").ok();
+        let force_software = std::env::var("PAL_RENDERER")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("software"));
+        if !force_software {
+            match WgpuBackend::new(window.clone(), size).await {
+                Ok(backend) => {
+                    return Ok(Self {
+                        window,
+                        backend: Backend::Wgpu(backend),
+                        size,
+                        virtual_size,
+                        clear_color: renderer_config.clear_color,
+                        frame_dump_path,
+                        frame_dump_written: false,
+                    });
+                }
+                Err(err) => {
+                    log::warn!(
+                        "GPU renderer unavailable ({err:#}); falling back to the software compositor"
+                    );
+                }
+            }
+        }
         let context =
             softbuffer::Context::new(window.clone()).map_err(|err| softbuffer_error(err))?;
         let mut surface = softbuffer::Surface::new(&context, window.clone())
@@ -73,15 +113,14 @@ impl Renderer {
             .map_err(|err| softbuffer_error(err))?;
         Ok(Self {
             window,
-            surface,
+            backend: Backend::Software(SoftwareBackend {
+                surface,
+                scene_textures: HashMap::new(),
+            }),
             size,
-            virtual_size: PhysicalSize::new(
-                renderer_config.virtual_width.max(1),
-                renderer_config.virtual_height.max(1),
-            ),
+            virtual_size,
             clear_color: renderer_config.clear_color,
-            scene_textures: HashMap::new(),
-            frame_dump_path: std::env::var("PAL_RENDER_DUMP").ok(),
+            frame_dump_path,
             frame_dump_written: false,
         })
     }
@@ -100,11 +139,16 @@ impl Renderer {
             return;
         }
         self.size = size;
-        if let Err(err) = self
-            .surface
-            .resize(nonzero(size.width), nonzero(size.height))
-        {
-            log::error!("failed to resize software renderer surface: {err}");
+        match &mut self.backend {
+            Backend::Software(backend) => {
+                if let Err(err) = backend
+                    .surface
+                    .resize(nonzero(size.width), nonzero(size.height))
+                {
+                    log::error!("failed to resize software renderer surface: {err}");
+                }
+            }
+            Backend::Wgpu(backend) => backend.resize(size),
         }
     }
 
@@ -117,19 +161,67 @@ impl Renderer {
         scene: &FrameScene,
         dump_path: Option<&Path>,
     ) -> RenderOutcome {
-        self.upload_scene_textures(scene);
         if self.size.width == 0 || self.size.height == 0 {
             return RenderOutcome::Skipped;
         }
-        match self.draw_surface_frame(scene, dump_path) {
-            Ok(()) => RenderOutcome::Rendered,
-            Err(err) => {
-                log::error!("software renderer failed: {err}");
-                RenderOutcome::Skipped
+        self.virtual_size = PhysicalSize::new(
+            scene.logical_width.max(1),
+            scene.logical_height.max(1),
+        );
+        let frame_dump = if self.frame_dump_written {
+            None
+        } else {
+            self.frame_dump_path.as_deref()
+        };
+        match &mut self.backend {
+            Backend::Software(backend) => {
+                match backend.render(scene, self.clear_color, self.size, frame_dump, dump_path) {
+                    Ok(wrote_frame_dump) => {
+                        self.frame_dump_written |= wrote_frame_dump;
+                        RenderOutcome::Rendered
+                    }
+                    Err(err) => {
+                        log::error!("software renderer failed: {err}");
+                        RenderOutcome::Skipped
+                    }
+                }
+            }
+            Backend::Wgpu(backend) => {
+                let outcome = match backend.render(scene, self.clear_color) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        log::error!("wgpu renderer failed: {err}");
+                        RenderOutcome::Skipped
+                    }
+                };
+                if frame_dump.is_some() || dump_path.is_some() {
+                    // GPU readback is not wired up; diagnostic dumps are
+                    // rasterized on the CPU at logical resolution instead, and
+                    // do not depend on the frame having been presented.
+                    let rgba = rasterize_scene_rgba(scene);
+                    let (width, height) = (scene.logical_width.max(1), scene.logical_height.max(1));
+                    if let Some(path) = frame_dump {
+                        match write_rgba_png(Path::new(path), &rgba, width, height) {
+                            Ok(()) => {
+                                self.frame_dump_written = true;
+                                log::info!("wrote renderer frame dump to {path}");
+                            }
+                            Err(err) => log::error!("failed to write frame dump {path}: {err}"),
+                        }
+                    }
+                    if let Some(path) = dump_path {
+                        if let Err(err) = write_rgba_png(path, &rgba, width, height) {
+                            log::error!("failed to write frame dump {}: {err}", path.display());
+                        }
+                    }
+                }
+                outcome
             }
         }
     }
+}
 
+impl SoftwareBackend {
     fn upload_scene_textures(&mut self, scene: &FrameScene) {
         self.scene_textures.retain(|texture_id, _| {
             scene
@@ -156,22 +248,21 @@ impl Renderer {
         }
     }
 
-    fn draw_surface_frame(
+    fn render(
         &mut self,
         scene: &FrameScene,
+        fallback_clear: wgpu::Color,
+        size: PhysicalSize<u32>,
+        frame_dump_path: Option<&str>,
         dump_path: Option<&Path>,
-    ) -> anyhow::Result<()> {
-        let width = self.size.width as usize;
-        let height = self.size.height as usize;
-        let clear = color_to_rgb(scene_clear_color(scene, self.clear_color));
-        let logical_size = [
-            scene.logical_width.max(1).min(u32::MAX),
-            scene.logical_height.max(1).min(u32::MAX),
-        ];
-        self.virtual_size = PhysicalSize::new(logical_size[0], logical_size[1]);
+    ) -> anyhow::Result<bool> {
+        self.upload_scene_textures(scene);
+        let width = size.width as usize;
+        let height = size.height as usize;
+        let clear = color_to_rgb(scene_clear_color(scene, fallback_clear));
         let metrics = RenderTargetMetrics::new(
             [width as u32, height as u32],
-            [self.virtual_size.width, self.virtual_size.height],
+            [scene.logical_width.max(1), scene.logical_height.max(1)],
         );
         let scene_textures = &self.scene_textures;
         let mut buffer = self
@@ -247,18 +338,17 @@ impl Renderer {
                 }
             }
         }
-        if !self.frame_dump_written {
-            if let Some(path) = self.frame_dump_path.as_deref() {
-                write_ppm(path, &buffer, width, height)?;
-                self.frame_dump_written = true;
-                log::info!("wrote software renderer frame dump to {path}");
-            }
+        let mut wrote_frame_dump = false;
+        if let Some(path) = frame_dump_path {
+            write_ppm(path, &buffer, width, height)?;
+            wrote_frame_dump = true;
+            log::info!("wrote software renderer frame dump to {path}");
         }
         if let Some(path) = dump_path {
             write_surface_png(path, &buffer, width, height)?;
         }
         buffer.present().map_err(|err| softbuffer_error(err))?;
-        Ok(())
+        Ok(wrote_frame_dump)
     }
 }
 
@@ -631,6 +721,20 @@ fn write_surface_png(
         rgba.push(0xFF);
     }
     writer.write_image_data(&rgba)?;
+    Ok(())
+}
+
+fn write_rgba_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(path)?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width.max(1), height.max(1));
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
     Ok(())
 }
 

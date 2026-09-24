@@ -699,6 +699,13 @@ struct TextSubsystemState {
     show_wait_mark: bool,
     wait_mark_sheet: Option<DecodedImage>,
     wait_mark_missing: bool,
+    /// Fully rasterized ADV panel + body text reused across reveal and
+    /// wait-mark frames, so a running reveal clips cached pixels instead of
+    /// re-rasterizing every glyph each frame.
+    render_cache: Option<AdvTextPanelCache>,
+    /// What the current text sprite surface already shows; identical frames
+    /// are skipped instead of re-uploading the same pixels.
+    presented_frame: Option<AdvTextPresentedFrame>,
 }
 
 impl TextSubsystemState {
@@ -784,8 +791,61 @@ impl Default for TextSubsystemState {
             show_wait_mark: false,
             wait_mark_sheet: None,
             wait_mark_missing: false,
+            render_cache: None,
+            presented_frame: None,
         }
     }
+}
+
+/// Per-line geometry of the cached ADV text block. `char_x` holds the
+/// cumulative pixel x of every character boundary (len == char_count + 1) so
+/// the smooth reveal can clip inside a glyph instead of snapping per char.
+#[derive(Clone, Debug)]
+struct AdvTextLineLayout {
+    y: u32,
+    height: u32,
+    char_start: usize,
+    char_count: usize,
+    char_x: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct AdvTextPanelCache {
+    /// Window base panel with no body text and no wait mark.
+    panel_width: u32,
+    panel_height: u32,
+    panel_rgba: Vec<u8>,
+    /// Fully rasterized body text block (all characters).
+    text_width: u32,
+    text_rgba: Vec<u8>,
+    text_origin_x: u32,
+    text_origin_y: u32,
+    lines: Vec<AdvTextLineLayout>,
+    full_char_count: usize,
+    sprite_x: i32,
+    sprite_y: i32,
+}
+
+impl AdvTextPanelCache {
+    /// Pixel position right after the last visible character, in text-block
+    /// coordinates. This is where the wait mark is anchored.
+    fn text_end_position(&self) -> (u32, u32) {
+        self.lines
+            .iter()
+            .rev()
+            .find(|line| line.char_count > 0)
+            .map(|line| (line.char_x[line.char_count], line.y))
+            .unwrap_or((0, 0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdvTextPresentedFrame {
+    /// `(line index, pixel x limit)` of the smooth reveal wipe. `None` means
+    /// the whole body text is visible.
+    reveal_limit: Option<(usize, u32)>,
+    /// Wait-mark animation frame currently blitted; `None` means no wait mark.
+    wait_mark_frame: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1790,6 +1850,7 @@ impl ScriptRuntime {
                 let _ = sprites.release(handle);
             }
             self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
             self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
@@ -1801,14 +1862,10 @@ impl ScriptRuntime {
                 let _ = sprites.view_ctrl(handle, false);
             }
             self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
             self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
-        let reveal_complete = self.text_state.reveal_enabled
-            && self
-                .pal_time_ms
-                .wrapping_sub(self.text_state.reveal_start_ms)
-                >= self.text_state.reveal_duration_ms;
         if !self.text_state.dirty
             && !self.text_state.reveal_enabled
             && !self.text_state.show_wait_mark
@@ -1833,9 +1890,94 @@ impl ScriptRuntime {
                 let _ = sprites.release(handle);
             }
             self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
             self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
+        let mut rebuilt = false;
+        if self.text_state.dirty || self.text_state.render_cache.is_none() {
+            self.rebuild_adv_text_render_cache(
+                assets,
+                nls,
+                resource_manager.as_mut().map(|manager| &mut **manager),
+                &body,
+            );
+            self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
+            rebuilt = true;
+            self.sync_adv_name_sprite(&name, sprites);
+        }
+        self.apply_pending_text_alpha_actions(sprites);
+        let reveal_limit = self.adv_text_reveal_limit();
+        let wait_frame = if self.text_state.show_wait_mark && reveal_limit.is_none() {
+            Some(self.pal_time_ms / 180)
+        } else {
+            None
+        };
+        let frame_key = AdvTextPresentedFrame {
+            reveal_limit,
+            wait_mark_frame: wait_frame,
+        };
+        if rebuilt
+            || self.text_state.presented_frame != Some(frame_key)
+            || self.text_state.sprite.is_none()
+        {
+            let composed = self.text_state.render_cache.as_ref().map(|cache| {
+                let wait_mark = wait_frame.map(|frame| {
+                    let color = argb_to_rgba_bytes(self.text_state.text_color);
+                    let (mark_w, mark_h, mark_rgba) = self
+                        .text_state
+                        .wait_mark_sheet
+                        .as_ref()
+                        .map(|sheet| wait_mark_frame(sheet, frame, color))
+                        .unwrap_or_else(|| fallback_wait_mark(color));
+                    let (mark_x, mark_y) = cache.text_end_position();
+                    (mark_w, mark_h, mark_rgba, mark_x, mark_y)
+                });
+                compose_adv_text_frame(cache, reveal_limit, wait_mark)
+            });
+            if let Some((width, height, rgba, x, y)) = composed {
+                // Native PAL draws ADV text windows above scene sprites but
+                // below the Game.exe button layer.
+                let z = 90;
+                let position_z = 0;
+                if let Some(handle) = self.text_state.sprite {
+                    let _ = sprites.replace_sprite_surface(
+                        handle,
+                        width,
+                        height,
+                        rgba,
+                        "adv:text".to_owned(),
+                    );
+                    let _ = sprites.set_pos(handle, x, y, position_z);
+                    let _ = sprites.set_priority(handle, z);
+                    let _ = sprites.view_ctrl(handle, true);
+                } else if let Some(handle) = sprites.create_rgba_sprite(
+                    width,
+                    height,
+                    rgba,
+                    PalVec3::new(x, y, position_z),
+                    z,
+                    "adv:text".to_owned(),
+                ) {
+                    self.text_state.sprite = Some(handle);
+                }
+                self.text_state.presented_frame = Some(frame_key);
+            }
+        }
+        self.sync_adv_button_chrome_visibility(sprites);
+    }
+
+    /// Rasterize the whole ADV body text once and split the result into a
+    /// base panel plus per-line glyph geometry. Reveal and wait-mark frames
+    /// then only re-clip these cached pixels.
+    fn rebuild_adv_text_render_cache(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        mut resource_manager: Option<&mut ResourceManager>,
+        body: &str,
+    ) {
         let saved_size = self.font_state.font_size();
         let saved_color = self.font_state.color();
         let native_text_size = self.text_state.init_font_size().max(1) as u16;
@@ -1844,57 +1986,22 @@ impl ScriptRuntime {
             self.text_state.text_color,
             self.text_state.text_effect_color,
         );
-        let (text_body, temporary_size) = parse_pal_text_directives(&body);
-        let full_text = text_body;
+        let (full_text, temporary_size) = parse_pal_text_directives(body);
         if let Some(size) = temporary_size {
             self.font_state.set_font_size(size);
-        }
-        let full_char_count = full_text.chars().count();
-        let mut visible_chars = full_char_count;
-        if self.text_state.reveal_enabled {
-            let elapsed = self
-                .pal_time_ms
-                .wrapping_sub(self.text_state.reveal_start_ms);
-            let duration = self.text_state.reveal_duration_ms.max(1);
-            if elapsed < duration {
-                let total = full_char_count.max(1);
-                visible_chars =
-                    ((elapsed as u64 * total as u64) / duration as u64).min(total as u64) as usize;
-            } else {
-                self.text_state.reveal_enabled = false;
-            }
-        } else if reveal_complete {
-            self.text_state.reveal_enabled = false;
         }
         let wrap_width = self.text_state.init_text_width().max(1) as u32;
         let (panel_text_width, panel_text_height, full_lines) =
             measure_wrapped_text(&self.font_state, &full_text, wrap_width);
-        let (mut text_width, mut text_height, mut text_rgba) =
-            rasterize_wrapped_text_lines(&self.font_state, &full_lines, visible_chars);
-        if self.text_state.show_wait_mark && visible_chars == full_char_count {
-            if let Some(manager) = resource_manager.as_mut() {
-                self.ensure_wait_mark_sheet(manager);
-            }
-            let (mark_x, mark_y) =
-                text_end_cursor(&self.font_state, &full_lines, visible_chars).unwrap_or((0, 0));
-            let frame = self.pal_time_ms / 180;
-            let color = argb_to_rgba_bytes(self.text_state.text_color);
-            let (mark_w, mark_h, mark_rgba) = self
-                .text_state
-                .wait_mark_sheet
-                .as_ref()
-                .map(|sheet| wait_mark_frame(sheet, frame, color))
-                .unwrap_or_else(|| fallback_wait_mark(color));
-            blit_rgba_expand(
-                &mut text_rgba,
-                &mut text_width,
-                &mut text_height,
-                &mark_rgba,
-                mark_w,
-                mark_h,
-                mark_x,
-                mark_y.saturating_add(4),
-            );
+        let (text_width, _text_height, text_rgba, lines) = rasterize_text_block_with_layout(
+            &self.font_state,
+            &full_lines,
+            panel_text_width,
+            panel_text_height,
+        );
+        let full_char_count = lines.iter().map(|line| line.char_count).sum();
+        if let Some(manager) = resource_manager.as_mut() {
+            self.ensure_wait_mark_sheet(manager);
         }
         let base_image =
             self.load_text_base_image(assets, nls, resource_manager, self.text_state.base);
@@ -1942,95 +2049,142 @@ impl ScriptRuntime {
         let text_leading = (u32::from(native_text_size) / 4).max(1);
         let text_origin_y =
             (text_draw_y.saturating_sub(y).max(0) as u32).saturating_add(text_leading);
-        // Native PAL draws ADV text windows above scene sprites but below the
-        // Game.exe button layer. Keeping the text surface at an extremely high
-        // priority hides MAIN_BTN_LOG/SKIP/AUTO/SYSTEM/SAVE/LOAD even though the
-        // button sprites exist and receive input.
-        let z = 90;
-        let position_z = 0;
         let min_width = self.text_state.init_text_width().max(760) as u32;
-        let (width, height, rgba) = compose_adv_text_panel(
+        let (panel_width, panel_height, panel_rgba, fallback_origin_x, fallback_origin_y) =
+            adv_text_base_panel(
+                panel_text_width,
+                panel_text_height,
+                min_width,
+                88,
+                base_image,
+                self.text_state.alpha,
+            );
+        let text_origin_x = if text_origin_x == 0 {
+            fallback_origin_x
+        } else {
+            text_origin_x
+        };
+        let text_origin_y = if text_origin_y == 0 {
+            fallback_origin_y
+        } else {
+            text_origin_y
+        };
+        self.text_state.render_cache = Some(AdvTextPanelCache {
+            panel_width,
+            panel_height,
+            panel_rgba,
             text_width,
-            text_height,
             text_rgba,
-            panel_text_width,
-            panel_text_height,
-            min_width,
-            88,
-            base_image,
-            self.text_state.alpha,
             text_origin_x,
             text_origin_y,
-        );
-        if let Some(handle) = self.text_state.sprite {
-            let _ =
-                sprites.replace_sprite_surface(handle, width, height, rgba, "adv:text".to_owned());
-            let _ = sprites.set_pos(handle, x, y, position_z);
-            let _ = sprites.set_priority(handle, z);
-            let _ = sprites.view_ctrl(handle, true);
-        } else if let Some(handle) = sprites.create_rgba_sprite(
-            width,
-            height,
-            rgba,
-            PalVec3::new(x, y, position_z),
-            z,
-            "adv:text".to_owned(),
-        ) {
-            self.text_state.sprite = Some(handle);
-        }
+            lines,
+            full_char_count,
+            sprite_x: x,
+            sprite_y: y,
+        });
+        self.font_state.set_font_size(saved_size);
+        self.font_state.set_color(saved_color.0, saved_color.1);
+    }
+
+    fn sync_adv_name_sprite(&mut self, name: &str, sprites: &mut SpriteSystem) {
         if name.is_empty() {
             if let Some(handle) = self.text_state.name_sprite.take() {
                 let _ = sprites.release(handle);
             }
-        } else {
-            self.font_state.set_font_size(22);
-            let (name, _) = parse_pal_text_directives(&name);
-            let (name_width, name_height, name_rgba) = self.font_state.rasterize(&name);
-            let name_surface_width = name_width.max(1);
-            let name_surface_height = name_height.max(1);
-            let name_surface = name_rgba;
-            let name_x = if self.text_state.init_name_x() != 0 {
-                self.text_state.init_name_x()
-            } else {
-                x + 18
-            };
-            let name_y = if self.text_state.init_name_y() != 0 {
-                self.text_state.init_name_y()
-            } else {
-                y.saturating_sub(name_surface_height as i32 + 8)
-            }
-            .saturating_add(text_leading as i32);
-            // The native name text is painted over the nameplate/VOICE button
-            // surface. That button lives on the button render lane, so z+1
-            // would leave the name underneath its own background.
-            let name_z = BUTTON_RENDER_PRIORITY + 1;
-            if let Some(handle) = self.text_state.name_sprite {
-                let _ = sprites.replace_sprite_surface(
-                    handle,
-                    name_surface_width,
-                    name_surface_height,
-                    name_surface,
-                    "adv:name".to_owned(),
-                );
-                let _ = sprites.set_pos(handle, name_x, name_y, position_z);
-                let _ = sprites.set_priority(handle, name_z);
-                let _ = sprites.view_ctrl(handle, true);
-            } else if let Some(handle) = sprites.create_rgba_sprite(
-                name_surface_width,
-                name_surface_height,
-                name_surface,
-                PalVec3::new(name_x, name_y, position_z),
-                name_z,
-                "adv:name".to_owned(),
-            ) {
-                self.text_state.name_sprite = Some(handle);
-            }
+            return;
         }
-        self.apply_pending_text_alpha_actions(sprites);
+        let saved_size = self.font_state.font_size();
+        let saved_color = self.font_state.color();
+        self.font_state.set_font_size(22);
+        let (name, _) = parse_pal_text_directives(name);
+        let (name_width, name_height, name_rgba) = self.font_state.rasterize(&name);
         self.font_state.set_font_size(saved_size);
         self.font_state.set_color(saved_color.0, saved_color.1);
-        self.text_state.dirty = false;
-        self.sync_adv_button_chrome_visibility(sprites);
+        let name_surface_width = name_width.max(1);
+        let name_surface_height = name_height.max(1);
+        let (x, y) = match self.text_state.render_cache.as_ref() {
+            Some(cache) => (cache.sprite_x, cache.sprite_y),
+            None => return,
+        };
+        let native_text_size = self.text_state.init_font_size().max(1) as u16;
+        let text_leading = (u32::from(native_text_size) / 4).max(1);
+        let name_x = if self.text_state.init_name_x() != 0 {
+            self.text_state.init_name_x()
+        } else {
+            x + 18
+        };
+        let name_y = if self.text_state.init_name_y() != 0 {
+            self.text_state.init_name_y()
+        } else {
+            y.saturating_sub(name_surface_height as i32 + 8)
+        }
+        .saturating_add(text_leading as i32);
+        // The native name text is painted over the nameplate/VOICE button
+        // surface. That button lives on the button render lane, so z+1
+        // would leave the name underneath its own background.
+        let name_z = BUTTON_RENDER_PRIORITY + 1;
+        let position_z = 0;
+        if let Some(handle) = self.text_state.name_sprite {
+            let _ = sprites.replace_sprite_surface(
+                handle,
+                name_surface_width,
+                name_surface_height,
+                name_rgba,
+                "adv:name".to_owned(),
+            );
+            let _ = sprites.set_pos(handle, name_x, name_y, position_z);
+            let _ = sprites.set_priority(handle, name_z);
+            let _ = sprites.view_ctrl(handle, true);
+        } else if let Some(handle) = sprites.create_rgba_sprite(
+            name_surface_width,
+            name_surface_height,
+            name_rgba,
+            PalVec3::new(name_x, name_y, position_z),
+            name_z,
+            "adv:name".to_owned(),
+        ) {
+            self.text_state.name_sprite = Some(handle);
+        }
+    }
+
+    /// Current reveal clip as `(line index, pixel x limit)`, or `None` when
+    /// the whole body text is visible. The limit interpolates inside the
+    /// current glyph so the wipe moves smoothly instead of per character.
+    fn adv_text_reveal_limit(&mut self) -> Option<(usize, u32)> {
+        if !self.text_state.reveal_enabled {
+            return None;
+        }
+        let elapsed = self
+            .pal_time_ms
+            .wrapping_sub(self.text_state.reveal_start_ms);
+        let duration = self.text_state.reveal_duration_ms.max(1);
+        if elapsed >= duration {
+            self.text_state.reveal_enabled = false;
+            return None;
+        }
+        let cache = self.text_state.render_cache.as_ref()?;
+        let total = cache.full_char_count.max(1) as f64;
+        let visible = (f64::from(elapsed) / f64::from(duration)) * total;
+        for (index, line) in cache.lines.iter().enumerate() {
+            if line.char_count == 0 {
+                continue;
+            }
+            let start = line.char_start as f64;
+            let end = start + line.char_count as f64;
+            if visible >= end {
+                continue;
+            }
+            if visible <= start {
+                return Some((index, 0));
+            }
+            let local = visible - start;
+            let char_index = (local.floor() as usize).min(line.char_count - 1);
+            let frac = (local - char_index as f64) as f32;
+            let x0 = line.char_x[char_index] as f32;
+            let x1 = line.char_x[char_index + 1] as f32;
+            return Some((index, (x0 + (x1 - x0) * frac).max(0.0) as u32));
+        }
+        None
     }
 
     fn sync_adv_button_chrome_visibility(&mut self, sprites: &mut SpriteSystem) {
@@ -15892,54 +16046,33 @@ fn measure_wrapped_text(
     (width, height.max(1), lines)
 }
 
-fn rasterize_wrapped_text(font: &PalFontSystem, text: &str, max_width: u32) -> (u32, u32, Vec<u8>) {
-    let (width, height, lines) = measure_wrapped_text(font, text, max_width);
-    rasterize_wrapped_text_lines_with_size(font, &lines, width, height, usize::MAX)
-}
-
-fn rasterize_wrapped_text_lines(
-    font: &PalFontSystem,
-    lines: &[String],
-    visible_chars: usize,
-) -> (u32, u32, Vec<u8>) {
-    let line_gap = (u32::from(font.font_size()).max(12) / 4).max(4);
-    let mut width = 1_u32;
-    let mut height = 0_u32;
-    for (index, line) in lines.iter().enumerate() {
-        let (line_width, line_height) = font.measure(line);
-        width = width.max(line_width.max(1));
-        if index > 0 {
-            height = height.saturating_add(line_gap);
-        }
-        height = height.saturating_add(line_height.max(1));
-    }
-    rasterize_wrapped_text_lines_with_size(font, lines, width, height.max(1), visible_chars)
-}
-
-fn rasterize_wrapped_text_lines_with_size(
+/// Rasterize every wrapped line once into a single text block and record the
+/// per-line geometry the smooth reveal clips against.
+fn rasterize_text_block_with_layout(
     font: &PalFontSystem,
     lines: &[String],
     width: u32,
     height: u32,
-    visible_chars: usize,
-) -> (u32, u32, Vec<u8>) {
+) -> (u32, u32, Vec<u8>, Vec<AdvTextLineLayout>) {
     let line_gap = (u32::from(font.font_size()).max(12) / 4).max(4);
+    let width = width.max(1);
+    let height = height.max(1);
     let mut rgba = vec![0_u8; (width * height * 4) as usize];
     let mut y = 0_u32;
-    let mut remaining = visible_chars;
+    let mut char_start = 0_usize;
+    let mut layouts = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
             y = y.saturating_add(line_gap);
         }
-        let line_visible_chars = remaining.min(line.chars().count());
-        remaining = remaining.saturating_sub(line_visible_chars);
-        let visible_line = if line_visible_chars >= line.chars().count() {
-            line.as_str().to_owned()
+        let line_y = y;
+        let char_count = line.chars().count();
+        let (_, layout_height) = font.measure(line);
+        let (line_width, line_height, line_rgba) = if line.is_empty() {
+            (0, 0, Vec::new())
         } else {
-            line.chars().take(line_visible_chars).collect()
+            font.rasterize(line)
         };
-        let (_, line_height_for_layout) = font.measure(line);
-        let (line_width, line_height, line_rgba) = font.rasterize(&visible_line);
         for sy in 0..line_height {
             for sx in 0..line_width {
                 let si = ((sy * line_width + sx) * 4) as usize;
@@ -15950,7 +16083,7 @@ fn rasterize_wrapped_text_lines_with_size(
                     continue;
                 }
                 let dx = sx;
-                let dy = y + sy;
+                let dy = line_y + sy;
                 if dx >= width || dy >= height {
                     continue;
                 }
@@ -15958,9 +16091,24 @@ fn rasterize_wrapped_text_lines_with_size(
                 alpha_blend_rgba(&mut rgba[di..di + 4], src);
             }
         }
-        y = y.saturating_add(line_height_for_layout.max(line_height).max(1));
+        let mut char_x = Vec::with_capacity(char_count + 1);
+        char_x.push(0);
+        for take in 1..=char_count {
+            let prefix: String = line.chars().take(take).collect();
+            char_x.push(font.measure(&prefix).0);
+        }
+        let advance = layout_height.max(line_height).max(1);
+        layouts.push(AdvTextLineLayout {
+            y: line_y,
+            height: advance,
+            char_start,
+            char_count,
+            char_x,
+        });
+        char_start += char_count;
+        y = y.saturating_add(advance);
     }
-    (width, height, rgba)
+    (width, height, rgba, layouts)
 }
 
 fn is_pal_text_tag(tag: &str) -> bool {
@@ -15974,80 +16122,115 @@ fn is_pal_text_tag(tag: &str) -> bool {
         || normalized.starts_with("r=")
 }
 
-fn compose_adv_text_panel(
-    src_width: u32,
-    src_height: u32,
-    text_rgba: Vec<u8>,
+/// ADV window panel without any body text: either the script's base image or
+/// the fallback dark window rectangle.
+fn adv_text_base_panel(
     panel_text_width: u32,
     panel_text_height: u32,
     min_width: u32,
     min_height: u32,
     base_image: Option<DecodedImage>,
     window_alpha: i32,
-    text_origin_x: u32,
-    text_origin_y: u32,
-) -> (u32, u32, Vec<u8>) {
+) -> (u32, u32, Vec<u8>, u32, u32) {
     let pad_x = 24_u32;
     let pad_y = 18_u32;
-    let (width, height, mut rgba, fallback_origin_x, fallback_origin_y) =
-        if let Some(base) = base_image {
-            let mut rgba = base.rgba;
-            let alpha = window_alpha.clamp(0, 255) as u8;
-            if alpha < 255 {
-                for px in rgba.chunks_exact_mut(4) {
-                    px[3] = ((u16::from(px[3]) * u16::from(alpha) + 127) / 255) as u8;
+    if let Some(base) = base_image {
+        let mut rgba = base.rgba;
+        let alpha = window_alpha.clamp(0, 255) as u8;
+        if alpha < 255 {
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = ((u16::from(px[3]) * u16::from(alpha) + 127) / 255) as u8;
+            }
+        }
+        (base.width, base.height, rgba, pad_x, pad_y)
+    } else {
+        let width = panel_text_width.saturating_add(pad_x * 2).max(min_width);
+        let height = panel_text_height.saturating_add(pad_y * 2).max(min_height);
+        let mut rgba = vec![0_u8; (width * height * 4) as usize];
+        let alpha = if window_alpha > 0 {
+            window_alpha.clamp(0, 255) as u8
+        } else {
+            184
+        };
+        for px in rgba.chunks_exact_mut(4) {
+            px[0] = 16;
+            px[1] = 16;
+            px[2] = 20;
+            px[3] = alpha;
+        }
+        (width, height, rgba, pad_x, pad_y)
+    }
+}
+
+/// Composite one presented ADV text frame from the cached panel and text
+/// block, clipping body glyphs at the smooth reveal limit and optionally
+/// blitting the wait mark. Returns the surface plus its sprite position.
+fn compose_adv_text_frame(
+    cache: &AdvTextPanelCache,
+    reveal_limit: Option<(usize, u32)>,
+    wait_mark: Option<(u32, u32, Vec<u8>, u32, u32)>,
+) -> (u32, u32, Vec<u8>, i32, i32) {
+    let mut rgba = cache.panel_rgba.clone();
+    let width = cache.panel_width;
+    let height = cache.panel_height;
+    for (index, line) in cache.lines.iter().enumerate() {
+        let x_limit = match reveal_limit {
+            None => u32::MAX,
+            Some((limit_line, limit_x)) => {
+                if index < limit_line {
+                    u32::MAX
+                } else if index == limit_line {
+                    limit_x
+                } else {
+                    0
                 }
             }
-            (base.width, base.height, rgba, pad_x, pad_y)
-        } else {
-            let width = panel_text_width.saturating_add(pad_x * 2).max(min_width);
-            let height = panel_text_height.saturating_add(pad_y * 2).max(min_height);
-            let mut rgba = vec![0_u8; (width * height * 4) as usize];
-            let alpha = if window_alpha > 0 {
-                window_alpha.clamp(0, 255) as u8
-            } else {
-                184
-            };
-            for px in rgba.chunks_exact_mut(4) {
-                px[0] = 16;
-                px[1] = 16;
-                px[2] = 20;
-                px[3] = alpha;
-            }
-            (width, height, rgba, pad_x, pad_y)
         };
-    let text_origin_x = if text_origin_x == 0 {
-        fallback_origin_x
-    } else {
-        text_origin_x
-    };
-    let text_origin_y = if text_origin_y == 0 {
-        fallback_origin_y
-    } else {
-        text_origin_y
-    };
-    let src_width = src_width.max(1);
-    let src_height = src_height.max(1);
-    for sy in 0..src_height {
-        for sx in 0..src_width {
-            let si = ((sy * src_width + sx) * 4) as usize;
-            let Some(src) = text_rgba.get(si..si + 4) else {
-                continue;
-            };
-            let alpha = src[3];
-            if alpha == 0 {
-                continue;
+        let x_limit = x_limit.min(cache.text_width);
+        if x_limit == 0 {
+            continue;
+        }
+        for sy in 0..line.height {
+            let dy = cache
+                .text_origin_y
+                .saturating_add(line.y)
+                .saturating_add(sy);
+            if dy >= height {
+                break;
             }
-            let dx = sx + text_origin_x;
-            let dy = sy + text_origin_y;
-            if dx >= width || dy >= height {
-                continue;
+            for sx in 0..x_limit {
+                let dx = cache.text_origin_x + sx;
+                if dx >= width {
+                    break;
+                }
+                let si = (((line.y + sy) * cache.text_width + sx) * 4) as usize;
+                let Some(src) = cache.text_rgba.get(si..si + 4) else {
+                    continue;
+                };
+                if src[3] == 0 {
+                    continue;
+                }
+                let di = ((dy * width + dx) * 4) as usize;
+                alpha_blend_rgba(&mut rgba[di..di + 4], src);
             }
-            let di = ((dy * width + dx) * 4) as usize;
-            alpha_blend_rgba(&mut rgba[di..di + 4], src);
         }
     }
-    (width, height, rgba)
+    if let Some((mark_w, mark_h, mark_rgba, mark_x, mark_y)) = wait_mark {
+        blit_rgba(
+            &mut rgba,
+            width,
+            height,
+            &mark_rgba,
+            mark_w,
+            mark_h,
+            cache.text_origin_x.saturating_add(mark_x),
+            cache
+                .text_origin_y
+                .saturating_add(mark_y)
+                .saturating_add(4),
+        );
+    }
+    (width, height, rgba, cache.sprite_x, cache.sprite_y)
 }
 
 fn alpha_blend_rgba(dst: &mut [u8], src: &[u8]) {
@@ -16101,36 +16284,6 @@ fn opaque_pal_font_color(color: u32) -> u32 {
     }
 }
 
-fn text_end_cursor(
-    font: &PalFontSystem,
-    lines: &[String],
-    visible_chars: usize,
-) -> Option<(u32, u32)> {
-    let line_gap = (u32::from(font.font_size()).max(12) / 4).max(4);
-    let mut y = 0u32;
-    let mut remaining = visible_chars;
-    let mut end = None;
-    for (index, line) in lines.iter().enumerate() {
-        if index > 0 {
-            y = y.saturating_add(line_gap);
-        }
-        let line_chars = line.chars().count();
-        let take = remaining.min(line_chars);
-        remaining = remaining.saturating_sub(take);
-        if take > 0 {
-            let visible: String = line.chars().take(take).collect();
-            let (width, _) = font.measure(&visible);
-            end = Some((width, y));
-        }
-        let (_, layout_height) = font.measure(line);
-        y = y.saturating_add(layout_height.max(1));
-        if remaining == 0 {
-            break;
-        }
-    }
-    end
-}
-
 fn wait_mark_frame(sheet: &DecodedImage, frame: u32, color: [u8; 4]) -> (u32, u32, Vec<u8>) {
     let cell_h = sheet.height.max(1);
     let frames = if cell_h > 0 && sheet.width.is_multiple_of(cell_h) {
@@ -16176,46 +16329,6 @@ fn fallback_wait_mark(color: [u8; 4]) -> (u32, u32, Vec<u8>) {
         }
     }
     (size, size, rgba)
-}
-
-fn blit_rgba_expand(
-    dst: &mut Vec<u8>,
-    dst_width: &mut u32,
-    dst_height: &mut u32,
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst_x: u32,
-    dst_y: u32,
-) {
-    let need_w = dst_x.saturating_add(src_width).max(*dst_width).max(1);
-    let need_h = dst_y.saturating_add(src_height).max(*dst_height).max(1);
-    if need_w != *dst_width || need_h != *dst_height {
-        let mut grown = vec![0u8; need_w as usize * need_h as usize * 4];
-        blit_rgba(
-            &mut grown,
-            need_w,
-            need_h,
-            dst,
-            *dst_width,
-            *dst_height,
-            0,
-            0,
-        );
-        *dst = grown;
-        *dst_width = need_w;
-        *dst_height = need_h;
-    }
-    blit_rgba(
-        dst,
-        *dst_width,
-        *dst_height,
-        src,
-        src_width,
-        src_height,
-        dst_x,
-        dst_y,
-    );
 }
 
 fn blit_rgba(
@@ -16822,6 +16935,69 @@ mod tests {
             ExtCallOutcome::Value(1)
         ));
         assert_eq!(runtime.stack, vec![99]);
+    }
+
+    #[test]
+    fn adv_text_frame_clips_body_text_at_the_smooth_reveal_limit() {
+        let mut panel_rgba = vec![0u8; 8 * 4 * 4];
+        for px in panel_rgba.chunks_exact_mut(4) {
+            px.copy_from_slice(&[16, 16, 20, 255]);
+        }
+        let mut text_rgba = vec![0u8; 8 * 2 * 4];
+        for px in text_rgba.chunks_exact_mut(4) {
+            px.copy_from_slice(&[200, 200, 200, 255]);
+        }
+        let cache = AdvTextPanelCache {
+            panel_width: 8,
+            panel_height: 4,
+            panel_rgba,
+            text_width: 8,
+            text_rgba,
+            text_origin_x: 0,
+            text_origin_y: 1,
+            lines: vec![
+                AdvTextLineLayout {
+                    y: 0,
+                    height: 1,
+                    char_start: 0,
+                    char_count: 4,
+                    char_x: vec![0, 2, 4, 6, 8],
+                },
+                AdvTextLineLayout {
+                    y: 1,
+                    height: 1,
+                    char_start: 4,
+                    char_count: 2,
+                    char_x: vec![0, 2, 4],
+                },
+            ],
+            full_char_count: 6,
+            sprite_x: 3,
+            sprite_y: 5,
+        };
+        let panel_pixel = |rgba: &[u8], x: u32, y: u32| {
+            let index = ((y * 8 + x) * 4) as usize;
+            rgba[index..index + 4].to_vec()
+        };
+
+        // Half-way through the second character of the first line: only the
+        // first three text columns are blended, the second line stays hidden.
+        let (w, h, rgba, sx, sy) = compose_adv_text_frame(&cache, Some((0, 3)), None);
+        assert_eq!((w, h, sx, sy), (8, 4, 3, 5));
+        assert_eq!(panel_pixel(&rgba, 2, 1), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&rgba, 3, 1), vec![16, 16, 20, 255]);
+        assert_eq!(panel_pixel(&rgba, 0, 2), vec![16, 16, 20, 255]);
+
+        // A limit on the second line keeps the first line fully visible.
+        let (_, _, rgba, _, _) = compose_adv_text_frame(&cache, Some((1, 2)), None);
+        assert_eq!(panel_pixel(&rgba, 7, 1), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&rgba, 1, 2), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&rgba, 2, 2), vec![16, 16, 20, 255]);
+
+        // No limit presents the entire cached text block.
+        let (_, _, full, _, _) = compose_adv_text_frame(&cache, None, None);
+        assert_eq!(panel_pixel(&full, 7, 1), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&full, 3, 2), vec![200, 200, 200, 255]);
     }
 
     #[test]
