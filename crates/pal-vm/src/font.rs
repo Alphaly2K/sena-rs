@@ -1,5 +1,6 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use pal_asset::Nls;
+use std::collections::BTreeMap;
 
 static DEFAULT_TTF_BYTES: &[u8] = include_bytes!("default.ttf");
 
@@ -185,13 +186,69 @@ impl PalBitmapFont {
         {
             return Err("font lookup table points outside the resource");
         }
-        Ok(Self {
+        let mut font = Self {
             bytes,
             offsets,
             nls,
             em_size: 28,
             baseline: 24,
-        })
+        };
+        if let Some((em_size, baseline)) = font.detect_cell_metrics() {
+            font.em_size = em_size;
+            font.baseline = baseline;
+        }
+        Ok(font)
+    }
+
+    /// Most PAL font records share a fullwidth cell advance. Infer the cell
+    /// size and baseline from the modal glyph metrics instead of assuming one
+    /// game's 28-pixel font; other resources use larger cells.
+    fn detect_cell_metrics(&self) -> Option<(u32, i32)> {
+        let mut counts = BTreeMap::<(u32, i32), usize>::new();
+        for &offset in &self.offsets {
+            let offset = offset as usize;
+            if offset == 0 {
+                continue;
+            }
+            let Some(end) = offset.checked_add(24) else {
+                continue;
+            };
+            let Some(header) = self.bytes.get(offset..end) else {
+                continue;
+            };
+            let word = |index: usize| {
+                u32::from_le_bytes(header[index * 4..index * 4 + 4].try_into().unwrap())
+            };
+            let (width, height, bearing_y, advance, bitmap_len) =
+                (word(0), word(1), word(3) as i32, word(4), word(5) as usize);
+            if width == 0
+                || height == 0
+                || advance == 0
+                || advance > 128
+                || width > advance
+                || height > advance
+            {
+                continue;
+            }
+            let stride = (width + 3) & !3;
+            if bitmap_len != stride as usize * height as usize
+                || end
+                    .checked_add(bitmap_len)
+                    .is_none_or(|end| end > self.bytes.len())
+            {
+                continue;
+            }
+            let baseline = bearing_y + ((advance - height) / 2) as i32;
+            if !(0..=advance as i32).contains(&baseline) {
+                continue;
+            }
+            *counts.entry((advance, baseline)).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 8)
+            .max_by_key(|(_, count)| *count)
+            .map(|(metrics, _)| metrics)
     }
 
     fn slot_for_char(&self, ch: char) -> Option<usize> {
@@ -515,6 +572,28 @@ mod tests {
         bytes
     }
 
+    fn fullwidth_bitmap_font_fixture(
+        width: u32,
+        height: u32,
+        bearing_y: i32,
+        advance: u32,
+    ) -> Vec<u8> {
+        // Shift-JIS "あ" occupies PAL slot (0x82 - 0x80) * 255 + 0xA0.
+        let kana_slot = 2 * 255 + 0xA0;
+        let table_end = ((kana_slot + 1) * 4) as u32;
+        let mut bytes = vec![0_u8; table_end as usize];
+        for slot in 0x20..0x30 {
+            bytes[slot * 4..slot * 4 + 4].copy_from_slice(&table_end.to_le_bytes());
+        }
+        bytes[kana_slot * 4..kana_slot * 4 + 4].copy_from_slice(&table_end.to_le_bytes());
+        let stride = (width + 3) & !3;
+        for value in [width, height, 0, bearing_y as u32, advance, stride * height] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend(std::iter::repeat_n(64, (stride * height) as usize));
+        bytes
+    }
+
     #[test]
     fn short_glyphs_share_the_cell_baseline_without_moving_centered_marks() {
         assert_eq!(glyph_baseline_shift(7, 23, 24.0, 28.0), 1);
@@ -567,6 +646,27 @@ mod tests {
         let alpha = |x: usize, y: usize| pixels[(y * width as usize + x) * 4 + 3];
         assert_eq!(alpha(1, 22), 255);
         assert_eq!(alpha(2, 23), 128);
+    }
+
+    #[test]
+    fn bitmap_font_uses_its_own_cell_size_without_clipping_large_glyphs() {
+        let font =
+            PalBitmapFont::parse(fullwidth_bitmap_font_fixture(36, 36, 31, 36), Nls::ShiftJis)
+                .unwrap();
+        assert_eq!((font.em_size, font.baseline), (36, 31));
+        let (width, height, pixels) = font.rasterize_line("あ", 26.0, [255; 4]);
+        assert_eq!((width, height), (26, 26));
+        assert_eq!(pixels[3], 255, "top row was clipped");
+        assert_eq!(
+            pixels[((height - 1) * width * 4 + 3) as usize],
+            255,
+            "bottom row was clipped"
+        );
+
+        let font =
+            PalBitmapFont::parse(fullwidth_bitmap_font_fixture(26, 26, 23, 28), Nls::ShiftJis)
+                .unwrap();
+        assert_eq!((font.em_size, font.baseline), (28, 24));
     }
 
     #[test]
