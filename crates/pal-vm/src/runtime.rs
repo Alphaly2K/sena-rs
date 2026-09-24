@@ -388,8 +388,6 @@ pub struct ScriptRuntime {
     pending_msp_wait_slot: Option<i32>,
     /// Game button entries keyed by (button group, entry index).
     game_buttons: BTreeMap<(i32, i32), GameButtonEntry>,
-    /// Button state suppressed while a modal menu covers the title.
-    title_modal_buttons: Option<BTreeMap<(i32, i32), (bool, bool, u8)>>,
     /// Native `btn_init` group records: normal/hover resource ids plus the
     /// current onmouse index returned by category 8 index 23.
     button_groups: BTreeMap<i32, GameButtonGroup>,
@@ -423,6 +421,9 @@ pub struct ScriptRuntime {
     bgm_replay_pending: bool,
     se_volume_percent: BTreeMap<i32, i32>,
     se_enabled: BTreeMap<i32, bool>,
+    /// Per-character voice volumes set from the SOUND menu's right-hand unit
+    /// grid (category 13 indexes 11/12 take the character slot).
+    voice_ex_volume_percent: BTreeMap<i32, i32>,
     se_muted: BTreeMap<i32, bool>,
     /// Native voice_wait stores a wait mask and rewinds PC until the voice checker reports idle.
     pending_voice_wait_slot: Option<i32>,
@@ -1262,7 +1263,6 @@ impl ScriptRuntime {
             game_msprites: BTreeMap::new(),
             pending_msp_wait_slot: None,
             game_buttons: BTreeMap::new(),
-            title_modal_buttons: None,
             button_groups: BTreeMap::new(),
             button_push_queue: BTreeMap::new(),
             pressed_button: None,
@@ -1280,6 +1280,7 @@ impl ScriptRuntime {
             bgm_replay_pending: false,
             se_volume_percent: BTreeMap::new(),
             se_enabled: BTreeMap::new(),
+            voice_ex_volume_percent: BTreeMap::new(),
             se_muted: BTreeMap::new(),
             pending_voice_wait_slot: None,
             font_state: PalFontSystem::new(),
@@ -1374,6 +1375,10 @@ impl ScriptRuntime {
                         if let Ok(slot) = slot.parse::<i32>() {
                             self.se_volume_percent.insert(slot, clamp_percent(value));
                         }
+                    } else if let Some(slot) = key.strip_prefix("voice_ex_volume_percent_") {
+                        if let Ok(slot) = slot.parse::<i32>() {
+                            self.voice_ex_volume_percent.insert(slot, clamp_percent(value));
+                        }
                     }
                 }
             }
@@ -1442,6 +1447,9 @@ impl ScriptRuntime {
         );
         for (slot, percent) in &self.se_volume_percent {
             text.push_str(&format!("se_volume_percent_{slot}={percent}\n"));
+        }
+        for (slot, percent) in &self.voice_ex_volume_percent {
+            text.push_str(&format!("voice_ex_volume_percent_{slot}={percent}\n"));
         }
         std::fs::write(&path, text)?;
         log::debug!("[trace-save] wrote portable system data {}", path.display());
@@ -2755,7 +2763,6 @@ impl ScriptRuntime {
                     .or_default()
                     .push_back(index);
                 self.pressed_button = Some((group, index));
-                self.hide_title_buttons_for_modal_entry(group, index, sprites);
                 self.dispatch_button_push_compat(group, index);
                 consumed_mouse_push = true;
                 log::debug!(
@@ -8099,9 +8106,6 @@ impl ScriptRuntime {
         if group < 0 || group == 0 {
             self.adv_menu_expanded = false;
         }
-        if group < 0 || group == 1 {
-            self.title_modal_buttons = None;
-        }
         let keys: Vec<_> = self
             .game_buttons
             .keys()
@@ -8249,17 +8253,19 @@ impl ScriptRuntime {
             .get(&(group, index))
             .map_or(0, |entry| entry.slider_offset);
         let mut knob_handle = None;
+        let mut knob_anchor: Option<(i32, i32)> = None;
         if let (Some(input), Some(sprites)) = (input, sprites) {
             if let Some(entry) = self.game_buttons.get(&(group, index)) {
                 let (mouse_x, mouse_y) = input.mouse_position();
                 if mouse_x >= 0 && mouse_y >= 0 {
                     if let Some(sprite) = sprites.get(entry.handle) {
                         let anchor = self
-                            .slider_anchor_position(sprites, group, index)
+                            .slider_anchor_position(sprites, group, index, axis)
                             .unwrap_or_else(|| {
                                 let pos = sprite.effective_position();
                                 (pos.x, pos.y)
                             });
+                        knob_anchor = Some(anchor);
                         let size = sprite.source_rect;
                         let raw = if axis == 1 {
                             mouse_y - anchor.1 - (size.height() / 2)
@@ -8287,13 +8293,12 @@ impl ScriptRuntime {
                 entry.slider_offset = offset;
             }
             if let Some(handle) = knob_handle {
-                let anchor = self.slider_anchor_position(sprites, group, index);
                 if let Some(sprite) = sprites.get_mut(handle) {
                     if axis == 1 {
-                        if let Some((_, base_y)) = anchor {
+                        if let Some((_, base_y)) = knob_anchor {
                             sprite.position.y = (base_y + offset) as f32;
                         }
-                    } else if let Some((base_x, _)) = anchor {
+                    } else if let Some((base_x, _)) = knob_anchor {
                         sprite.position.x = (base_x + offset) as f32;
                     }
                 }
@@ -8325,11 +8330,15 @@ impl ScriptRuntime {
         let axis = args[3];
         let value = args[4];
         let offset = (travel as i64 * value as i64 / 100).clamp(0, travel as i64) as i32;
+        // Resolve the anchor from the pre-update offset: the knob still rests
+        // at `anchor + old_offset`, so the old value pins the anchor down.
+        let anchor = sprites
+            .as_deref()
+            .and_then(|sprites| self.slider_anchor_position(sprites, group, index, axis));
         for entry in self.matching_button_entries_mut(group, index) {
             entry.slider_offset = offset;
         }
         if let Some(sprites) = sprites {
-            let anchor = self.slider_anchor_position(sprites, group, index);
             for handle in self.matching_button_handles(group, index) {
                 if let Some(sprite) = sprites.get_mut(handle) {
                     if axis == 1 {
@@ -8502,25 +8511,9 @@ impl ScriptRuntime {
     /// `btn_unlock(group)` matches Game.exe sub_40E040 and clears native
     /// group-level lock fields.  The compatibility runtime unlocks every entry
     /// in the group.
-    fn ext_btn_unlock(&mut self, mut sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
+    fn ext_btn_unlock(&mut self, _sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let group = args.first().copied().unwrap_or(-1);
-        if group == 1 {
-            if let Some(saved) = self.title_modal_buttons.take() {
-                for (key, (visible, enabled, alpha)) in saved {
-                    let Some(entry) = self.game_buttons.get_mut(&key) else {
-                        continue;
-                    };
-                    entry.visible = visible;
-                    entry.enabled = enabled;
-                    entry.alpha = alpha;
-                    if let Some(sprites) = sprites.as_deref_mut() {
-                        sprites.view_ctrl(entry.handle, visible);
-                        sprites.set_alpha(entry.handle, alpha);
-                    }
-                }
-            }
-        }
         for entry in self.matching_button_entries_mut(group, -1) {
             entry.locked = false;
         }
@@ -8955,12 +8948,26 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             11 => {
-                self.pop_ext_args(0);
-                ExtCallOutcome::Value(self.text_state.voice_volume)
+                // get_voice_ex_volume(slot): per-character voice percent for the
+                // SOUND menu unit grid; slots without an entry follow the global
+                // voice volume.
+                let args = self.pop_ext_args(1);
+                let slot = args.first().copied().unwrap_or(0);
+                let value = self
+                    .voice_ex_volume_percent
+                    .get(&slot)
+                    .copied()
+                    .unwrap_or(self.text_state.voice_volume);
+                ExtCallOutcome::Value(value)
             }
             12 => {
-                let args = self.pop_ext_args(1);
-                self.text_state.voice_volume = clamp_percent(args.first().copied().unwrap_or(100));
+                // set_voice_ex_volume(slot, volume, extra): the drag loop pushes
+                // the character slot, the slider percent, and a third scratch
+                // value (unmapped in native notes); all three are consumed.
+                let args = self.pop_ext_args(3);
+                let slot = args.first().copied().unwrap_or(0);
+                let volume = clamp_percent(args.get(1).copied().unwrap_or(100));
+                self.voice_ex_volume_percent.insert(slot, volume);
                 ExtCallOutcome::Value(1)
             }
             14 => {
@@ -12752,7 +12759,6 @@ impl ScriptRuntime {
         }
         self.game_buttons.clear();
         self.button_push_queue.clear();
-        self.title_modal_buttons = None;
         self.system_buttons.clear();
         for retired in self.retired_sprites.drain(..) {
             sprites.release(retired.handle);
@@ -12996,6 +13002,34 @@ impl ScriptRuntime {
                 percent_to_volume(self.bgm_volume_percent)
             };
             let _ = audio.set_group_volume(PalSoundGroup::GROUP3, volume);
+        }
+    }
+
+    /// Push the configured volume levels into the audio system.  Called once at
+    /// boot after `load_portable_system_data`: the persisted settings otherwise
+    /// only reach Kira when the script happens to call a volume extcall, so a
+    /// muted or lowered configuration would still play at full volume.
+    pub fn apply_persisted_audio_levels(&self, audio: &mut AudioSystem) {
+        log::debug!(
+            "[trace-audio] apply persisted levels: master={}%(muted={}) bgm={}%(muted={}) voice={}%(muted={}) se_slots={}",
+            self.master_volume_percent,
+            self.master_muted,
+            self.bgm_volume_percent,
+            self.bgm_muted,
+            self.text_state.voice_volume,
+            self.text_state.voice_muted,
+            self.se_volume_percent.len(),
+        );
+        self.apply_master_volume(Some(audio));
+        self.apply_bgm_group_volume(Some(audio));
+        let voice_volume = if self.text_state.voice_muted {
+            PalVolume::MIN
+        } else {
+            percent_to_volume(self.text_state.voice_volume)
+        };
+        let _ = audio.set_group_volume(PalSoundGroup::GROUP1, voice_volume);
+        if !self.se_volume_percent.is_empty() {
+            let _ = audio.set_group_volume(PalSoundGroup::GROUP4, self.effective_se_group_volume());
         }
     }
 
@@ -13764,7 +13798,26 @@ impl ScriptRuntime {
                 formatted.push(ch);
                 continue;
             }
-            let Some(spec) = chars.next() else {
+            // wsprintf-style conversion: %, optional zero-pad flag and width,
+            // then the specifier (`sound_unit%02d`, `save_page%02d`, ...).
+            let mut zero_pad = false;
+            let mut width = 0usize;
+            let mut spec = None;
+            for next in chars.by_ref() {
+                match next {
+                    '0' if width == 0 && !zero_pad => zero_pad = true,
+                    '1'..='9' => {
+                        width = width
+                            .saturating_mul(10)
+                            .saturating_add(next.to_digit(10).unwrap_or(0) as usize);
+                    }
+                    _ => {
+                        spec = Some(next);
+                        break;
+                    }
+                }
+            }
+            let Some(spec) = spec else {
                 formatted.push('%');
                 break;
             };
@@ -13774,6 +13827,17 @@ impl ScriptRuntime {
             }
             let value = args.get(value_index).copied().unwrap_or_default();
             value_index = value_index.saturating_add(1);
+            // Numeric conversions accept dynamic-string arguments the way the
+            // native formatter does: the buffer content is parsed (`Sound.csv`
+            // hands the unit index over as a one-character string).
+            let numeric = if is_dynamic_string_handle(value) {
+                dynamic_string_index(value)
+                    .and_then(|index| self.dynamic_strings.get(index))
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                    .unwrap_or(value)
+            } else {
+                value
+            };
             match spec {
                 's' | 'S' | 'f' | 'F' => {
                     let text = self
@@ -13782,11 +13846,25 @@ impl ScriptRuntime {
                         .unwrap_or_else(|| value.to_string());
                     formatted.push_str(&text);
                 }
-                'd' | 'D' | 'i' | 'I' => formatted.push_str(&value.to_string()),
-                'x' => formatted.push_str(&format!("{value:x}")),
-                'X' => formatted.push_str(&format!("{value:X}")),
+                'd' | 'D' | 'i' | 'I' => {
+                    if zero_pad {
+                        formatted.push_str(&format!("{numeric:0width$}", width = width));
+                    } else if width > 0 {
+                        formatted.push_str(&format!("{numeric:width$}", width = width));
+                    } else {
+                        formatted.push_str(&numeric.to_string());
+                    }
+                }
+                'x' => formatted.push_str(&format!("{numeric:x}")),
+                'X' => formatted.push_str(&format!("{numeric:X}")),
                 other => {
                     formatted.push('%');
+                    if zero_pad {
+                        formatted.push('0');
+                    }
+                    if width > 0 {
+                        formatted.push_str(&width.to_string());
+                    }
                     formatted.push(other);
                 }
             }
@@ -13916,8 +13994,17 @@ impl ScriptRuntime {
                 .unwrap_or(default),
             None => default,
         };
-        let handle = self.store_dynamic_string(value.clone());
-        self.write_temp_mem_relative(128, handle);
+        // args[3] is a caller-supplied destination dynamic-string buffer; the
+        // SOUND menu passes one and then hands the same handle to open_file.
+        // Native does not echo the handle into the task work bank — writing it
+        // to temp_mem[base+128] clobbers the SOUND menu's unit loop counter.
+        let dst = args[3];
+        let handle = if is_dynamic_string_handle(dst) {
+            self.replace_dynamic_string(dst, value.clone());
+            dst
+        } else {
+            self.store_dynamic_string(value.clone())
+        };
         log::debug!(
             "[trace-script] ext_0012_0024.sz_buf section={section:?} key={key:?} requested_filename={requested_filename:?} used_filename={filename:?} -> {value:?}"
         );
@@ -14426,15 +14513,23 @@ impl ScriptRuntime {
     /// sliders out as adjacent track/knob pairs, but the index offset varies
     /// (SOUND page uses knob = base + 10 on the main column and knob = base +
     /// 20 on the per-character column; the ADV bar uses knob = base + 1).
-    /// Pick the neighbouring button whose sprite is closest to the knob.
+    /// Neighbouring knobs sit between the pair, so plain proximity picks the
+    /// wrong button.  Instead use the knob's stored drag offset: the anchor is
+    /// the neighbour sitting closest to where the knob would rest at offset 0.
     fn slider_anchor_position(
         &self,
         sprites: &SpriteSystem,
         group: i32,
         index: i32,
+        axis: i32,
     ) -> Option<(i32, i32)> {
         let knob = self.game_buttons.get(&(group, index))?;
         let knob_pos = sprites.get(knob.handle)?.effective_position();
+        let expected = if axis == 1 {
+            (knob_pos.x, knob_pos.y - knob.slider_offset)
+        } else {
+            (knob_pos.x - knob.slider_offset, knob_pos.y)
+        };
         let mut best: Option<(i64, (i32, i32))> = None;
         for delta in [20, 10, 2, 1] {
             if index < delta {
@@ -14448,61 +14543,12 @@ impl ScriptRuntime {
             };
             let pos = sprite.effective_position();
             let distance =
-                (pos.x - knob_pos.x).abs() as i64 + (pos.y - knob_pos.y).abs() as i64;
+                (pos.x - expected.0).abs() as i64 + (pos.y - expected.1).abs() as i64;
             if best.map_or(true, |(best_distance, _)| distance < best_distance) {
                 best = Some((distance, (pos.x, pos.y)));
             }
         }
         best.map(|(_, pos)| pos)
-    }
-
-    /// Title menu callbacks (Game script points 3030/3031/3032) only store the
-    /// requested modal page in `memdat[158]` before entering the shared system
-    /// menu dispatcher at point 3081.  Native PAL button state removes the title
-    /// group from the active view at that transition; without mirroring that
-    /// side effect, DATA LOAD / SYSTEM controls are painted on top of the still
-    /// interactive title menu.
-    fn hide_title_buttons_for_modal_entry(
-        &mut self,
-        group: i32,
-        index: i32,
-        sprites: &mut SpriteSystem,
-    ) {
-        if group != 1 || !matches!(index, 3..=6) {
-            return;
-        }
-
-        if self.title_modal_buttons.is_some() {
-            return;
-        }
-        self.title_modal_buttons = Some(
-            self.game_buttons
-                .iter()
-                .filter(|((button_group, _), _)| *button_group == group)
-                .map(|(key, entry)| (*key, (entry.visible, entry.enabled, entry.alpha)))
-                .collect(),
-        );
-
-        let keys = self
-            .game_buttons
-            .keys()
-            .copied()
-            .filter(|(button_group, _)| *button_group == 1)
-            .collect::<Vec<_>>();
-
-        for key in keys {
-            let Some(entry) = self.game_buttons.get_mut(&key) else {
-                continue;
-            };
-            entry.enabled = false;
-            entry.alpha = 0;
-            sprites.view_ctrl(entry.handle, false);
-            if let Some(sprite) = sprites.get_mut(entry.handle) {
-                sprite.color = PalColor::from_argb(sprite.color.0 & 0x00FF_FFFF);
-            }
-        }
-
-        log::debug!("[trace-button] title modal entry hid group=1 source_index={index}");
     }
 
     fn dispatch_button_push_compat(&mut self, group: i32, index: i32) {

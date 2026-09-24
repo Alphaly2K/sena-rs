@@ -141,7 +141,7 @@ impl Engine {
             },
         );
 
-        Ok(Self {
+        let mut engine = Self {
             config,
             startup_config,
             resource_manager,
@@ -157,7 +157,11 @@ impl Engine {
             pal_debug: pal_debug_enabled(),
             last_scene: None,
             active_crossfade: None,
-        })
+        };
+        if let Some(runtime) = &engine.runtime {
+            runtime.apply_persisted_audio_levels(&mut engine.audio);
+        }
+        Ok(engine)
     }
 
     pub fn config(&self) -> &EngineConfig {
