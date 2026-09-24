@@ -389,6 +389,10 @@ pub struct ScriptRuntime {
     button_groups: BTreeMap<i32, GameButtonGroup>,
     /// Latched button pushes keyed by group; consumed by btn_get_push(group).
     button_push_queue: BTreeMap<i32, VecDeque<i32>>,
+    /// Button whose mouse press is still held down.  PAL buttons capture the
+    /// mouse while pressed; slider drag loops poll this through btn_on_check,
+    /// which reports -1 once the press ends.
+    pressed_button: Option<(i32, i32)>,
     adv_menu_expanded: bool,
     /// Game category 12 system/menu button table.
     system_buttons: BTreeMap<i32, GameSystemButtonEntry>,
@@ -1255,6 +1259,7 @@ impl ScriptRuntime {
             title_modal_buttons: None,
             button_groups: BTreeMap::new(),
             button_push_queue: BTreeMap::new(),
+            pressed_button: None,
             adv_menu_expanded: false,
             system_buttons: BTreeMap::new(),
             game_audio: BTreeMap::new(),
@@ -1358,7 +1363,13 @@ impl ScriptRuntime {
                 "voice_muted" => self.text_state.voice_muted = value != 0,
                 "text_skip_enabled" => self.text_skip_enabled = value != 0,
                 "text_auto_enabled" => self.text_auto_enabled = value != 0,
-                _ => {}
+                key => {
+                    if let Some(slot) = key.strip_prefix("se_volume_percent_") {
+                        if let Ok(slot) = slot.parse::<i32>() {
+                            self.se_volume_percent.insert(slot, clamp_percent(value));
+                        }
+                    }
+                }
             }
         }
         log::debug!(
@@ -1412,7 +1423,7 @@ impl ScriptRuntime {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = format!(
+        let mut text = format!(
             "master_volume_percent={}\nmaster_muted={}\nbgm_volume_percent={}\nbgm_muted={}\nvoice_volume_percent={}\nvoice_muted={}\ntext_skip_enabled={}\ntext_auto_enabled={}\n",
             self.master_volume_percent,
             i32::from(self.master_muted),
@@ -1423,6 +1434,9 @@ impl ScriptRuntime {
             i32::from(self.text_skip_enabled),
             i32::from(self.text_auto_enabled),
         );
+        for (slot, percent) in &self.se_volume_percent {
+            text.push_str(&format!("se_volume_percent_{slot}={percent}\n"));
+        }
         std::fs::write(&path, text)?;
         log::debug!("[trace-save] wrote portable system data {}", path.display());
         Ok(path)
@@ -2708,6 +2722,9 @@ impl ScriptRuntime {
             return true;
         }
         let hovered = self.button_hit_at(sprites, mouse_x, mouse_y, -1);
+        if !input.mouse_on(PalMouseButton::Left) {
+            self.pressed_button = None;
+        }
         let mut consumed_mouse_push = false;
         if input.mouse_push(PalMouseButton::Left) {
             if let Some((group, index)) = hovered {
@@ -2715,6 +2732,7 @@ impl ScriptRuntime {
                     .entry(group)
                     .or_default()
                     .push_back(index);
+                self.pressed_button = Some((group, index));
                 self.hide_title_buttons_for_modal_entry(group, index, sprites);
                 self.dispatch_button_push_compat(group, index);
                 consumed_mouse_push = true;
@@ -3659,11 +3677,19 @@ impl ScriptRuntime {
                 };
                 let var_val = self.read_var(operand.lo as usize)?;
                 let signed_idx = base.wrapping_add(var_val);
-                let Some(idx) =
-                    checked_script_mem_index("temp_mem", signed_idx, self.temp_mem.len())
-                else {
+                if signed_idx < 0 {
+                    log::debug!(
+                        "[trace-vm] temp_mem signed index {signed_idx} out of range; ignoring write"
+                    );
                     return Ok(());
-                };
+                }
+                let idx = signed_idx as usize;
+                // The native work bank is one flat region; large argument_base
+                // frames legitimately address past the default size.  Grow like
+                // write_temp_mem_absolute instead of dropping the write.
+                if idx >= self.temp_mem.len() {
+                    self.temp_mem.resize(idx + 1, 0);
+                }
                 self.temp_mem[idx] = value;
                 Ok(())
             }
@@ -4089,20 +4115,20 @@ impl ScriptRuntime {
                 "get_select_on_key" => return self.dispatch_select_stub(8),
                 "get_select_pull_key" => return self.dispatch_select_stub(9),
                 "get_select_push_key" => return self.dispatch_select_stub(10),
-                "set_font_size" => return self.dispatch_font_system_stub(27),
-                "get_font_size" => return self.dispatch_font_system_stub(28),
-                "get_font_type" => return self.dispatch_font_system_stub(29),
-                "set_font_effect" => return self.dispatch_font_system_stub(30),
-                "get_font_effect" => return self.dispatch_font_system_stub(31),
-                "set_font_color" => return self.dispatch_font_system_stub(19),
-                "get_font_color" => return self.dispatch_font_system_stub(55),
-                "input_clear" => return self.dispatch_font_system_stub(35),
-                "change_window_size" => return self.dispatch_font_system_stub(36),
-                "change_aspect_mode" => return self.dispatch_font_system_stub(37),
-                "get_aspect_mode" => return self.dispatch_font_system_stub(40),
-                "enable_window_change" => return self.dispatch_font_system_stub(46),
-                "is_enable_window_change" => return self.dispatch_font_system_stub(47),
-                "history_skip" => return self.dispatch_font_system_stub(57),
+                "set_font_size" => return self.dispatch_font_system_stub(27, input),
+                "get_font_size" => return self.dispatch_font_system_stub(28, input),
+                "get_font_type" => return self.dispatch_font_system_stub(29, input),
+                "set_font_effect" => return self.dispatch_font_system_stub(30, input),
+                "get_font_effect" => return self.dispatch_font_system_stub(31, input),
+                "set_font_color" => return self.dispatch_font_system_stub(19, input),
+                "get_font_color" => return self.dispatch_font_system_stub(55, input),
+                "input_clear" => return self.dispatch_font_system_stub(35, input),
+                "change_window_size" => return self.dispatch_font_system_stub(36, input),
+                "change_aspect_mode" => return self.dispatch_font_system_stub(37, input),
+                "get_aspect_mode" => return self.dispatch_font_system_stub(40, input),
+                "enable_window_change" => return self.dispatch_font_system_stub(46, input),
+                "is_enable_window_change" => return self.dispatch_font_system_stub(47, input),
+                "history_skip" => return self.dispatch_font_system_stub(57, input),
                 "save" => {
                     return self.dispatch_save_stub(0, assets, nls, resource_manager, sprites)
                 }
@@ -4263,7 +4289,7 @@ impl ScriptRuntime {
             },
             7 => self.dispatch_wait_ext(index),
             8 => self.dispatch_button_ext(index, assets, nls, resource_manager, sprites, input),
-            9 => self.dispatch_font_system_stub(index),
+            9 => self.dispatch_font_system_stub(index, input),
             10 => self.dispatch_save_stub(index, assets, nls, resource_manager, sprites),
             12 => self.dispatch_system_button_stub(index),
             14 => self.dispatch_history_stub(index),
@@ -4479,8 +4505,34 @@ impl ScriptRuntime {
         }
     }
 
-    fn dispatch_font_system_stub(&mut self, index: u16) -> ExtCallOutcome {
+    fn dispatch_font_system_stub(
+        &mut self,
+        index: u16,
+        input: Option<&PalInputState>,
+    ) -> ExtCallOutcome {
         match index {
+            12 => {
+                // Game.exe `input_mouse_to_mem(dst_x, dst_y)`: copy the live PAL
+                // mouse position into caller-chosen work slots (-1 skips a
+                // lane).  The SOUND/SYSTEM slider track-click handlers read the
+                // position back from these slots to compute the knob percent.
+                let args = self.pop_ext_args(2);
+                if args.len() < 2 {
+                    return ExtCallOutcome::Block;
+                }
+                let (mouse_x, mouse_y) = input
+                    .map(|input| input.mouse_position())
+                    .unwrap_or((-1, -1));
+                let dst_x = args[0];
+                let dst_y = args[1];
+                if dst_x >= 0 {
+                    self.write_temp_mem_absolute(dst_x, mouse_x);
+                }
+                if dst_y >= 0 {
+                    self.write_temp_mem_absolute(dst_y, mouse_y);
+                }
+                ExtCallOutcome::Value(1)
+            }
             0 => {
                 let args = self.pop_ext_args(1);
                 self.text_skip_enabled = args.first().copied().unwrap_or(0) != 0;
@@ -5390,7 +5442,7 @@ impl ScriptRuntime {
             8 => return self.ext_btn_release(index, sprites),
             5 => return self.ext_btn_view_ctrl(true, sprites),
             6 => return self.ext_btn_set_pos(sprites),
-            9 => return self.ext_btn_slider_get(input, sprites.as_deref()),
+            9 => return self.ext_btn_slider_get(input, sprites),
             10 => return self.ext_btn_slider_set(sprites),
             11 => return self.ext_btn_slider_begin(),
             12 => return self.ext_btn_on_check(input, sprites.as_deref()),
@@ -8159,7 +8211,7 @@ impl ScriptRuntime {
     fn ext_btn_slider_get(
         &mut self,
         input: Option<&PalInputState>,
-        sprites: Option<&SpriteSystem>,
+        sprites: Option<&mut SpriteSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(5);
         if args.len() < 5 {
@@ -8174,36 +8226,57 @@ impl ScriptRuntime {
             .game_buttons
             .get(&(group, index))
             .map_or(0, |entry| entry.slider_offset);
-        if let (Some(input), Some(sprites), Some(entry)) =
-            (input, sprites, self.game_buttons.get(&(group, index)))
-        {
-            let (mouse_x, mouse_y) = input.mouse_position();
-            if mouse_x >= 0 && mouse_y >= 0 {
-                if let Some(sprite) = sprites.get(entry.handle) {
-                    let anchor = self
-                        .slider_anchor_position(sprites, group, index)
-                        .unwrap_or_else(|| {
-                            let pos = sprite.effective_position();
-                            (pos.x, pos.y)
-                        });
-                    let size = sprite.source_rect;
-                    let raw = if axis == 1 {
-                        mouse_y - anchor.1 - (size.height() / 2)
-                    } else {
-                        mouse_x - anchor.0 - (size.width() / 2)
-                    };
-                    offset = raw.clamp(0, max_offset);
-                    if snap_to_100 && max_offset >= 100 && offset != max_offset {
-                        let step = (max_offset / 100).max(1);
-                        let rem = offset % step;
-                        if rem != 0 {
-                            offset = (offset + rem).min(max_offset);
+        let mut knob_handle = None;
+        if let (Some(input), Some(sprites)) = (input, sprites) {
+            if let Some(entry) = self.game_buttons.get(&(group, index)) {
+                let (mouse_x, mouse_y) = input.mouse_position();
+                if mouse_x >= 0 && mouse_y >= 0 {
+                    if let Some(sprite) = sprites.get(entry.handle) {
+                        let anchor = self
+                            .slider_anchor_position(sprites, group, index)
+                            .unwrap_or_else(|| {
+                                let pos = sprite.effective_position();
+                                (pos.x, pos.y)
+                            });
+                        let size = sprite.source_rect;
+                        let raw = if axis == 1 {
+                            mouse_y - anchor.1 - (size.height() / 2)
+                        } else {
+                            mouse_x - anchor.0 - (size.width() / 2)
+                        };
+                        offset = raw.clamp(0, max_offset);
+                        if snap_to_100
+                            && max_offset >= 100
+                            && offset != 0
+                            && offset != max_offset
+                        {
+                            // Native hundred-step snapping: round the offset so
+                            // the script-side `offset * 100 / max` percent is
+                            // integral.
+                            let percent = (offset as i64 * 100 + max_offset as i64 / 2)
+                                / max_offset as i64;
+                            offset = (percent * max_offset as i64 / 100) as i32;
                         }
+                        knob_handle = Some(entry.handle);
                     }
                 }
             }
-        }
-        if let Some(entry) = self.game_buttons.get_mut(&(group, index)) {
+            if let Some(entry) = self.game_buttons.get_mut(&(group, index)) {
+                entry.slider_offset = offset;
+            }
+            if let Some(handle) = knob_handle {
+                let anchor = self.slider_anchor_position(sprites, group, index);
+                if let Some(sprite) = sprites.get_mut(handle) {
+                    if axis == 1 {
+                        if let Some((_, base_y)) = anchor {
+                            sprite.position.y = (base_y + offset) as f32;
+                        }
+                    } else if let Some((base_x, _)) = anchor {
+                        sprite.position.x = (base_x + offset) as f32;
+                    }
+                }
+            }
+        } else if let Some(entry) = self.game_buttons.get_mut(&(group, index)) {
             entry.slider_offset = offset;
         }
         log::debug!(
@@ -8212,9 +8285,13 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(offset)
     }
 
-    /// Category 8 index 10 initializes or updates a slider button position.
-    /// Observed scripts pass `(group,index,offset,axis,enabled)` before entering
-    /// a poll loop; native code stores the offset and moves the PAL button cell.
+    /// Category 8 index 10 initializes or updates a slider button from its
+    /// logical value.  Observed scripts pass `(group,index,travel,axis,value)`
+    /// before entering a poll loop: `travel` is the knob's pixel travel
+    /// (slider width minus end caps) and `value` is the current setting as a
+    /// percentage of that travel (BGM deliberately passes up to 250 for a
+    /// pinned-max knob).  Native stores the knob offset and moves the button
+    /// cell to `anchor + travel * value / 100`.
     fn ext_btn_slider_set(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(5);
         if args.len() < 5 {
@@ -8222,12 +8299,12 @@ impl ScriptRuntime {
         }
         let group = args[0];
         let index = args[1];
-        let offset = args[2].max(0);
+        let travel = args[2].max(0);
         let axis = args[3];
-        let enabled = args[4] != 0;
+        let value = args[4];
+        let offset = (travel as i64 * value as i64 / 100).clamp(0, travel as i64) as i32;
         for entry in self.matching_button_entries_mut(group, index) {
             entry.slider_offset = offset;
-            entry.enabled = enabled;
         }
         if let Some(sprites) = sprites {
             let anchor = self.slider_anchor_position(sprites, group, index);
@@ -8250,7 +8327,7 @@ impl ScriptRuntime {
             }
         }
         log::debug!(
-            "[trace-button] btn_slider_set group={group} index={index} offset={offset} axis={axis} enabled={enabled}"
+            "[trace-button] btn_slider_set group={group} index={index} travel={travel} axis={axis} value={value} -> offset={offset}"
         );
         ExtCallOutcome::Value(1)
     }
@@ -8267,10 +8344,12 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Category 8 index 12 checks whether the given button has a pending click
-    /// reaction.  Native sub_410CE0 calls PalButtonGetReaction, which is fed by
-    /// PalButton's reaction latch after a mouse push; hover belongs to the
-    /// separate btn_get_onmouse path and must not make this predicate true.
+    /// Category 8 index 12 reports whether the given button is still pressed.
+    /// The SOUND/SYSTEM slider drag loops poll this as
+    /// `while btn_on_check(group, index) != -1`, so the native convention is
+    /// `-1` once the press ends and any other value while the button holds the
+    /// mouse.  PAL buttons capture the mouse on push, so the press survives the
+    /// cursor leaving the knob rect until the button is released.
     fn ext_btn_on_check(
         &mut self,
         _input: Option<&PalInputState>,
@@ -8282,15 +8361,15 @@ impl ScriptRuntime {
         }
         let group = args[0];
         let index = args[1];
-        // Native `PalButtonGetReaction` consumes the PAL button reaction latch.
-        // It does not synthesize a reaction from the current cursor hover.  The
-        // portable engine fills `button_push_queue` once per frame from
-        // `update_button_input_state`; consuming only that latch prevents a
-        // stale mouse-down edge from clicking the next menu page after a button
-        // callback swaps groups.
-        let active = self.consume_latched_button_if(group, index);
-        log::debug!("[trace-button] btn_on_check group={group} index={index} -> {active}");
-        ExtCallOutcome::Value(i32::from(active))
+        let active = match self.pressed_button {
+            Some((pressed_group, pressed_index)) => {
+                pressed_group == group && (index < 0 || pressed_index == index)
+            }
+            None => false,
+        };
+        let value = if active { 1 } else { -1 };
+        log::debug!("[trace-button] btn_on_check group={group} index={index} -> {value}");
+        ExtCallOutcome::Value(value)
     }
 
     /// `btn_get_push(group)` is the portable counterpart of Game category 8
@@ -8710,15 +8789,11 @@ impl ScriptRuntime {
             1 => self.ext_audio_stop(4, PalSoundGroup::GROUP3, audio),
             2 => self.ext_bgm_set_volume(audio),
             3 => {
-                // bgm_get_volume(slot) returns a percent-style integer.  The
-                // current engine keeps group volume globally, so this returns
-                // the PAL default until per-slot BGM volume is fully modeled.
+                // bgm_get_volume(slot) returns the configured BGM percent the
+                // SOUND slider should display, not the live (possibly muted or
+                // ducked) group level.
                 self.pop_ext_args(1);
-                let value = audio
-                    .as_ref()
-                    .map(|audio| volume_to_percent(audio.group_volume(PalSoundGroup::GROUP3)))
-                    .unwrap_or(100);
-                ExtCallOutcome::Value(value)
+                ExtCallOutcome::Value(self.bgm_volume_percent)
             }
             4 => {
                 // bgm_get_auto_volume(): SOUND menu queries this zero-arg value
@@ -8782,12 +8857,11 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             5 => {
-                self.pop_ext_args(1);
-                let value = audio
-                    .as_ref()
-                    .map(|audio| volume_to_percent(audio.group_volume(PalSoundGroup::GROUP4)))
-                    .unwrap_or(100);
-                ExtCallOutcome::Value(value)
+                // se_get_volume(slot) returns the configured percent for that
+                // SE lane; the SOUND menu seeds its SE/SSE sliders from it.
+                let args = self.pop_ext_args(1);
+                let slot = args.first().copied().unwrap_or(0);
+                ExtCallOutcome::Value(self.se_volume_percent.get(&slot).copied().unwrap_or(100))
             }
             6 => self.ext_audio_stop(5, PalSoundGroup::GROUP4, audio),
             7 => self.ext_se_wait(audio),
@@ -11579,9 +11653,12 @@ impl ScriptRuntime {
         let Some(slot) = args.first().copied() else {
             return ExtCallOutcome::Block;
         };
-        let value = if let (Some(handle), Some(sprites)) =
-            (self.game_sprites.get(&slot).copied(), sprites)
-        {
+        let handle = self
+            .game_sprites
+            .get(&slot)
+            .copied()
+            .or_else(|| self.packed_button_sprite_handle(slot));
+        let value = if let (Some(handle), Some(sprites)) = (handle, sprites) {
             (if width {
                 sprites.get_width(handle).unwrap_or(0)
             } else {
@@ -11591,6 +11668,20 @@ impl ScriptRuntime {
             0
         };
         ExtCallOutcome::Value(value)
+    }
+
+    /// Menu scripts address button sprites from generic sprite extcalls through
+    /// a packed reference `0x02000000 | group << 20 | index` (observed in the
+    /// SOUND menu passing slider base/knob refs to `sp_get_width`).  Resolve
+    /// that encoding to the registered button sprite.
+    fn packed_button_sprite_handle(&self, slot: i32) -> Option<SpriteHandle> {
+        let raw = slot as u32;
+        if raw & 0x0200_0000 == 0 {
+            return None;
+        }
+        let group = ((raw >> 20) & 0x1F) as i32;
+        let index = (raw & 0x000F_FFFF) as i32;
+        self.game_buttons.get(&(group, index)).map(|entry| entry.handle)
     }
 
     fn ext_sp_get_scale(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
@@ -14303,29 +14394,38 @@ impl ScriptRuntime {
             .collect()
     }
 
+    /// Locate the slider track anchor for a knob button.  Script families lay
+    /// sliders out as adjacent track/knob pairs, but the index offset varies
+    /// (SOUND page uses knob = base + 10 on the main column and knob = base +
+    /// 20 on the per-character column; the ADV bar uses knob = base + 1).
+    /// Pick the neighbouring button whose sprite is closest to the knob.
     fn slider_anchor_position(
         &self,
         sprites: &SpriteSystem,
         group: i32,
         index: i32,
     ) -> Option<(i32, i32)> {
-        let mut candidates = Vec::with_capacity(4);
-        if index >= 10 {
-            candidates.push(index - 10);
-        }
-        if index >= 2 {
-            candidates.push(index - 2);
-        }
-        if index >= 1 {
-            candidates.push(index - 1);
-        }
-        candidates.push(index);
-        candidates.into_iter().find_map(|base_index| {
-            let entry = self.game_buttons.get(&(group, base_index))?;
-            let sprite = sprites.get(entry.handle)?;
+        let knob = self.game_buttons.get(&(group, index))?;
+        let knob_pos = sprites.get(knob.handle)?.effective_position();
+        let mut best: Option<(i64, (i32, i32))> = None;
+        for delta in [20, 10, 2, 1] {
+            if index < delta {
+                continue;
+            }
+            let Some(entry) = self.game_buttons.get(&(group, index - delta)) else {
+                continue;
+            };
+            let Some(sprite) = sprites.get(entry.handle) else {
+                continue;
+            };
             let pos = sprite.effective_position();
-            Some((pos.x, pos.y))
-        })
+            let distance =
+                (pos.x - knob_pos.x).abs() as i64 + (pos.y - knob_pos.y).abs() as i64;
+            if best.map_or(true, |(best_distance, _)| distance < best_distance) {
+                best = Some((distance, (pos.x, pos.y)));
+            }
+        }
+        best.map(|(_, pos)| pos)
     }
 
     /// Title menu callbacks (Game script points 3030/3031/3032) only store the
@@ -14585,45 +14685,6 @@ impl ScriptRuntime {
             self.button_push_queue.remove(&first_group);
         }
         value
-    }
-
-    fn consume_latched_button_if(&mut self, group: i32, index: i32) -> bool {
-        if group >= 0 {
-            let Some(queue) = self.button_push_queue.get_mut(&group) else {
-                return false;
-            };
-            let matched = queue
-                .front()
-                .is_some_and(|hit_index| index < 0 || *hit_index == index);
-            if matched {
-                queue.pop_front();
-                if queue.is_empty() {
-                    self.button_push_queue.remove(&group);
-                }
-            }
-            return matched;
-        }
-
-        let Some(hit_group) = self
-            .button_push_queue
-            .iter()
-            .find_map(|(button_group, queue)| {
-                queue
-                    .front()
-                    .is_some_and(|hit_index| index < 0 || *hit_index == index)
-                    .then_some(*button_group)
-            })
-        else {
-            return false;
-        };
-        let Some(queue) = self.button_push_queue.get_mut(&hit_group) else {
-            return false;
-        };
-        queue.pop_front();
-        if queue.is_empty() {
-            self.button_push_queue.remove(&hit_group);
-        }
-        true
     }
 
     fn forget_button_handles(&mut self, group: i32, index: i32) {
@@ -16864,6 +16925,106 @@ mod tests {
         assert_eq!(runtime.temp_mem[0], 448);
         assert_eq!(runtime.temp_mem[1], 376);
         assert_eq!(runtime.stack, [99]);
+    }
+
+    #[test]
+    fn slider_set_maps_value_percent_to_knob_offset() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let entry = |handle, name: &str| GameButtonEntry {
+            handle,
+            name: name.to_owned(),
+            visible: true,
+            enabled: true,
+            locked: false,
+            toggle: 0,
+            alpha: 255,
+            slider_offset: 0,
+            hit_rect: None,
+            gosub_point: None,
+            anim_resource: None,
+            anim_play_flag: 0,
+        };
+        let mut base_desc = SpriteDesc::new(SceneTextureId(1), 240, 32);
+        base_desc.position = PalVec3::new(72, 153, 0);
+        let base_handle = sprites.create(base_desc);
+        let mut knob_desc = SpriteDesc::new(SceneTextureId(2), 19, 16);
+        knob_desc.position = PalVec3::new(72, 161, 0);
+        let knob_handle = sprites.create(knob_desc);
+        runtime
+            .game_buttons
+            .insert((6, 0), entry(base_handle, "SOUND_SLIDE_BASE_UNIT"));
+        runtime
+            .game_buttons
+            .insert((6, 20), entry(knob_handle, "SOUND_SLIDE_ICON_UNIT"));
+        // Push order: value, axis, travel, index, group (group pops first).
+        runtime.stack = vec![75, 0, 208, 20, 6];
+        assert!(matches!(
+            runtime.ext_btn_slider_set(Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.game_buttons[&(6, 20)].slider_offset, 156);
+        assert_eq!(sprites.get(knob_handle).unwrap().position.x, 228.0);
+
+        // Values above 100% pin the knob at the travel end (BGM passes 250).
+        runtime.stack = vec![250, 0, 208, 20, 6];
+        assert!(matches!(
+            runtime.ext_btn_slider_set(Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.game_buttons[&(6, 20)].slider_offset, 208);
+        assert_eq!(sprites.get(knob_handle).unwrap().position.x, 280.0);
+    }
+
+    #[test]
+    fn slider_on_check_reports_minus_one_unless_button_is_held() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        runtime.stack = vec![20, 6];
+        assert!(matches!(
+            runtime.ext_btn_on_check(None, None),
+            ExtCallOutcome::Value(-1)
+        ));
+        runtime.pressed_button = Some((6, 20));
+        runtime.stack = vec![20, 6];
+        assert!(matches!(
+            runtime.ext_btn_on_check(None, None),
+            ExtCallOutcome::Value(1)
+        ));
+    }
+
+    #[test]
+    fn sp_get_width_resolves_packed_button_reference() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let desc = SpriteDesc::new(SceneTextureId(1), 240, 32);
+        let handle = sprites.create(desc);
+        runtime.game_buttons.insert(
+            (6, 0),
+            GameButtonEntry {
+                handle,
+                name: "SOUND_SLIDE_BASE_UNIT".to_owned(),
+                visible: true,
+                enabled: true,
+                locked: false,
+                toggle: 0,
+                alpha: 255,
+                slider_offset: 0,
+                hit_rect: None,
+                gosub_point: None,
+                anim_resource: None,
+                anim_play_flag: 0,
+            },
+        );
+        runtime.stack = vec![0x0260_0000];
+        assert!(matches!(
+            runtime.ext_sp_get_dimension(Some(&mut sprites), true),
+            ExtCallOutcome::Value(240)
+        ));
+        runtime.stack = vec![0x0260_0000];
+        assert!(matches!(
+            runtime.ext_sp_get_dimension(Some(&mut sprites), false),
+            ExtCallOutcome::Value(32)
+        ));
     }
 
     #[test]
