@@ -662,6 +662,10 @@ impl Engine {
         }
         scene.commands.extend(sprite_commands);
         if let Some(runtime) = self.runtime.as_ref() {
+            let shake = runtime.effect_shake_offset();
+            if shake != [0, 0] {
+                translate_scene_commands(&mut scene.commands, shake[0], shake[1]);
+            }
             let effect = runtime.effect_state();
             if let Some((start, texture)) = self.active_crossfade.as_ref().filter(|(start, _)| {
                 effect.is_some_and(|effect| effect.effect_id == 1 && effect.start_ms == *start)
@@ -675,7 +679,12 @@ impl Engine {
                     scene.commands.push(DrawCommand::Sprite(SpriteDraw {
                         texture_id: texture.id,
                         priority: i32::MAX,
-                        dst: RectF::new(0.0, 0.0, logical_width as f32, logical_height as f32),
+                        dst: RectF::new(
+                            shake[0] as f32,
+                            shake[1] as f32,
+                            logical_width as f32,
+                            logical_height as f32,
+                        ),
                         // Renderer UVs are normalized. Pixel dimensions here sample
                         // only the last texel, so the previous warning image never fades.
                         src: RectF::new(0.0, 0.0, 1.0, 1.0),
@@ -698,6 +707,21 @@ impl Engine {
             }
         }
         scene
+    }
+}
+
+fn translate_scene_commands(commands: &mut [DrawCommand], x: i32, y: i32) {
+    for command in commands {
+        match command {
+            DrawCommand::Sprite(sprite) => {
+                sprite.dst.x += x as f32;
+                sprite.dst.y += y as f32;
+            }
+            DrawCommand::SolidQuad(quad) => {
+                quad.dst.x += x as f32;
+                quad.dst.y += y as f32;
+            }
+        }
     }
 }
 

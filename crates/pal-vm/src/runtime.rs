@@ -1416,6 +1416,10 @@ impl ScriptRuntime {
             .overlay_quad(logical_width, logical_height, self.pal_time_ms)
     }
 
+    pub fn effect_shake_offset(&self) -> [i32; 2] {
+        self.effect_system.shake_offset(self.pal_time_ms)
+    }
+
     pub fn effect_state(&self) -> Option<crate::effect::PalEffectState> {
         self.effect_system.state()
     }
