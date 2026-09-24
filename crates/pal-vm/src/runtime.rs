@@ -153,9 +153,11 @@ fn game_sprite_priority(slot: i32) -> i32 {
     slot_order
 }
 
-const BUTTON_RENDER_PRIORITY: i32 = 100;
+// Popup scripts place their frame in sprite slot 127. Buttons live in a
+// separate PAL table, so draw them after that frame in our shared render tree.
+const BUTTON_RENDER_PRIORITY: i32 = 128;
 
-// Save-slot button surfaces use priority 100. `thumbnail_set` and the save
+// Save-slot button surfaces use the button priority. `thumbnail_set` and the save
 // text draw calls paint onto their shared canvas in PAL; when represented as
 // separate sprites they must sit above those translucent button surfaces.
 const SAVE_DRAWING_PRIORITY: i32 = BUTTON_RENDER_PRIORITY + 1;
@@ -2210,6 +2212,23 @@ impl ScriptRuntime {
                 .sprite
                 .is_some_and(|handle| sprites.get(handle).is_some_and(|sprite| sprite.visible));
         let menu_bases = self.adv_menu_bases(sprites);
+        // Some scripts leave quick-save/load at alpha zero while fading the
+        // rest of the ADV toolbar through the native button table. Mirror the
+        // live alpha of its visible peers, including when the toolbar fades
+        // away, instead of restoring those two controls to 255 every frame.
+        let inline_quick_peer_alpha = self
+            .game_buttons
+            .iter()
+            .filter(|((group, _), entry)| {
+                *group == 0
+                    && entry.visible
+                    && entry.enabled
+                    && !entry.name.eq_ignore_ascii_case("MAIN_BTN_QSAVE")
+                    && !entry.name.eq_ignore_ascii_case("MAIN_BTN_QLOAD")
+            })
+            .filter_map(|(_, entry)| sprites.get(entry.handle).map(|sprite| sprite.color.alpha()))
+            .max()
+            .unwrap_or(0);
         for ((group, _), entry) in self.game_buttons.iter() {
             if *group != 0 {
                 continue;
@@ -2237,12 +2256,11 @@ impl ScriptRuntime {
             } else {
                 chrome_visible && entry.visible && entry.enabled
             };
+            let compatible_quick_alpha = inline_quick_button && entry.alpha == 0;
+            let visible = visible && (!compatible_quick_alpha || inline_quick_peer_alpha > 0);
             let _ = sprites.view_ctrl(entry.handle, visible);
-            if visible && inline_quick_button && entry.alpha == 0 {
-                // Some scripts register the inline quick controls but leave
-                // their initial button alpha at zero while showing the rest
-                // of the same toolbar. Restore the cell's draw alpha here.
-                sprites.set_alpha(entry.handle, 255);
+            if compatible_quick_alpha {
+                sprites.set_alpha(entry.handle, inline_quick_peer_alpha);
             }
         }
     }
@@ -16884,6 +16902,116 @@ enum StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_buttons_draw_above_the_popup_frame() {
+        let mut sprites = SpriteSystem::new();
+        let button = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                BUTTON_RENDER_PRIORITY,
+                "button",
+            )
+            .unwrap();
+        let frame = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                127,
+                "popup frame",
+            )
+            .unwrap();
+        let order = sprites
+            .commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                crate::scene::DrawCommand::Sprite(draw) => Some(draw.texture_id.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                sprites.get(frame).unwrap().surface.0,
+                sprites.get(button).unwrap().surface.0
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_quick_buttons_follow_toolbar_alpha() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let text = sprites
+            .create_rgba_sprite(2, 2, vec![255; 16], PalVec3::new(0, 0, 0), 90, "adv:text")
+            .unwrap();
+        runtime.text_state.initialized = true;
+        runtime.text_state.visible = true;
+        runtime.text_state.sprite = Some(text);
+
+        let entry = |handle, name: &str, alpha| GameButtonEntry {
+            handle,
+            name: name.to_owned(),
+            visible: true,
+            enabled: true,
+            locked: false,
+            toggle: 0,
+            alpha,
+            slider_offset: 0,
+            hit_rect: None,
+            gosub_point: None,
+            anim_resource: None,
+            anim_play_flag: 0,
+        };
+        let peer = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                BUTTON_RENDER_PRIORITY,
+                "save",
+            )
+            .unwrap();
+        let quick = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                BUTTON_RENDER_PRIORITY,
+                "quick save",
+            )
+            .unwrap();
+        sprites.set_alpha(quick, 0);
+        runtime
+            .game_buttons
+            .insert((0, 5), entry(peer, "MAIN_BTN_SAVE", 255));
+        runtime
+            .game_buttons
+            .insert((0, 7), entry(quick, "MAIN_BTN_QSAVE", 0));
+
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(sprites.get(quick).unwrap().visible);
+        assert_eq!(sprites.get(quick).unwrap().color.alpha(), 255);
+
+        sprites.set_alpha(peer, 0);
+        runtime.game_buttons.get_mut(&(0, 5)).unwrap().alpha = 0;
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(!sprites.get(quick).unwrap().visible);
+        assert_eq!(sprites.get(quick).unwrap().color.alpha(), 0);
+
+        sprites.set_alpha(peer, 128);
+        runtime.game_buttons.get_mut(&(0, 5)).unwrap().alpha = 128;
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(sprites.get(quick).unwrap().visible);
+        assert_eq!(sprites.get(quick).unwrap().color.alpha(), 128);
+    }
 
     #[test]
     fn pgd_default_offsets_use_native_stage_coordinates() {
