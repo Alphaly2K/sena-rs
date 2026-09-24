@@ -15,6 +15,9 @@ pub struct CoreAssets {
     pub graphic_dat: Option<LoadedAsset>,
     pub script_check_value: u32,
     pub script_entry_pc: u32,
+    /// A later SoftPAL extension set exposes the millisecond clock at 18:121
+    /// and uses a different SE load/play argument contract.
+    pub extended_softpal: bool,
     pub point_table: PointTable,
     pub graphic_index: Option<GraphicIndex>,
 }
@@ -62,6 +65,13 @@ impl CoreAssets {
         // Extract values before moving `script`; script_image borrows script.bytes.
         let script_check_value = script_image.check_value();
         let script_entry_pc = script_image.entry_pc();
+        // Probe an aligned extcall opcode/category pair rather than a game
+        // title. The later script uses 18:121 as its PAL millisecond clock.
+        let extended_softpal = script
+            .bytes[12..]
+            .windows(8)
+            .step_by(4)
+            .any(|words| words == [0x17, 0x00, 0x01, 0x00, 0x79, 0x00, 0x12, 0x00]);
         let _ = script_image; // release borrow of script.bytes before moving script
 
         Ok(Self {
@@ -73,6 +83,7 @@ impl CoreAssets {
             graphic_dat,
             script_check_value,
             script_entry_pc,
+            extended_softpal,
             point_table,
             graphic_index,
         })

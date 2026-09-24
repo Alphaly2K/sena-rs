@@ -3792,6 +3792,10 @@ impl ScriptRuntime {
                 38 => self.ext_write_private_profile_int(assets, nls, resource_manager),
                 39 => self.ext_write_private_profile_string(assets, nls, resource_manager),
                 40 => self.ext_access_clear(),
+                // Later SoftPAL scripts use this zero-argument clock query in
+                // their own elapsed-time loops. Return the same PAL clock that
+                // drives wait_sync and renderer effects.
+                121 => ExtCallOutcome::Value(self.pal_time_ms as i32),
                 _ => ExtCallOutcome::Skip,
             },
             7 => self.dispatch_wait_ext(index),
@@ -3801,7 +3805,7 @@ impl ScriptRuntime {
             12 => self.dispatch_system_button_stub(index),
             14 => self.dispatch_history_stub(index),
             6 => self.dispatch_select_stub(index),
-            15 => self.dispatch_misc_system_stub(index),
+            15 => self.dispatch_misc_system_stub(index, assets.extended_softpal),
             16 => self.dispatch_window_effect_stub(index),
             21 => self.dispatch_thread_stub(index, point_table),
             22 => self.dispatch_run_ext(index),
@@ -4925,7 +4929,7 @@ impl ScriptRuntime {
             11 => return self.ext_btn_slider_begin(),
             12 => return self.ext_btn_on_check(input, sprites.as_deref()),
             13 => return self.ext_btn_set_toggle(sprites),
-            14 => return self.ext_btn_set_state(sprites),
+            14 => return self.ext_btn_get_pos(sprites.as_deref()),
             15 => return self.ext_btn_enable(sprites),
             16 => return self.ext_btn_set_alpha(sprites),
             17 => return self.ext_btn_get_push(input, sprites.as_deref()),
@@ -4935,6 +4939,8 @@ impl ScriptRuntime {
             21 => return self.ext_btn_set_anim(assets, nls, resource_manager, sprites),
             22 => return self.ext_btn_set_hit(),
             23 => return self.ext_btn_get_onmouse(input, sprites.as_deref()),
+            29 => return self.ext_btn_set_state(sprites),
+            37 => return self.ext_btn_get_alpha(sprites.as_deref()),
             41 => {
                 // The table-driven button constructor carries the regular
                 // btn_set fields followed by its source rectangle dimensions.
@@ -6328,21 +6334,20 @@ impl ScriptRuntime {
         }
     }
 
-    fn dispatch_misc_system_stub(&mut self, index: u16) -> ExtCallOutcome {
+    fn dispatch_misc_system_stub(&mut self, index: u16, extended_softpal: bool) -> ExtCallOutcome {
         match index {
             2 => {
                 self.pop_ext_args(1);
             }
             4 => {
-                // Later PAL scripts pass three arguments. Older scripts also
-                // prefix those values with five 0x0FFFFFFF sentinels. Consume
-                // the complete form so the function-frame base below it is not
-                // restored from a leftover sentinel during startup.
-                let extended = self.stack.len() >= 8
+                // The extended SoftPAL branch passes eight values here,
+                // including live layout values as well as sentinels. The
+                // older form can also carry five sentinel defaults.
+                let padded = self.stack.len() >= 8
                     && self.stack[self.stack.len() - 8..self.stack.len() - 3]
                         .iter()
                         .all(|&value| value == 0x0FFF_FFFF);
-                self.pop_ext_args(if extended { 8 } else { 3 });
+                self.pop_ext_args(if extended_softpal || padded { 8 } else { 3 });
             }
             5 => {
                 let args = self.pop_ext_args(1);
@@ -7929,10 +7934,36 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Category 8 index 14 is the native button state/cell setter.  Game.sqlite
-    /// sub_410790 pops `(group,index,ctrl,state)` and calls `PalButtonCtrl`
-    /// followed by `PalButtonSetPos`; settings/load/save scripts call this in
-    /// tight batches, so the fourth pop is part of the stack contract.
+    /// Category 8 index 14 writes a button's current x/y position into two
+    /// caller-chosen temporary-memory slots. Both games read those slots
+    /// before placing another button. Leaving them stale can turn File.dat
+    /// string handles into offscreen coordinates.
+    fn ext_btn_get_pos(&mut self, sprites: Option<&SpriteSystem>) -> ExtCallOutcome {
+        let args = self.pop_ext_args(4);
+        if args.len() < 4 {
+            return ExtCallOutcome::Block;
+        }
+        let (group, index, x_slot, y_slot) = (args[0], args[1], args[2], args[3]);
+        let position = self
+            .game_buttons
+            .get(&(group, index))
+            .and_then(|entry| sprites?.get(entry.handle))
+            .map(|sprite| {
+                (
+                    sprite.position.x.round() as i32,
+                    sprite.position.y.round() as i32,
+                )
+            });
+        let Some((x, y)) = position else {
+            return ExtCallOutcome::Value(0);
+        };
+        self.write_temp_mem_absolute(x_slot, x);
+        self.write_temp_mem_absolute(y_slot, y);
+        log::debug!("[trace-button] btn_get_pos group={group} index={index} slots=({x_slot},{y_slot}) pos=({x},{y})");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// Category 8 index 29 selects the button control mode and visual cell.
     fn ext_btn_set_state(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(4);
         if args.len() < 4 {
@@ -7980,6 +8011,24 @@ impl ScriptRuntime {
         }
         log::debug!("[trace-button] btn_set_alpha group={group} index={index} alpha={alpha}");
         ExtCallOutcome::Value(1)
+    }
+
+    fn ext_btn_get_alpha(&mut self, sprites: Option<&SpriteSystem>) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let (group, index) = (args[0], args[1]);
+        let alpha = self
+            .game_buttons
+            .get(&(group, index))
+            .map(|entry| {
+                sprites
+                    .and_then(|sprites| sprites.get(entry.handle))
+                    .map_or(entry.alpha, |sprite| sprite.color.alpha())
+            })
+            .unwrap_or(0);
+        ExtCallOutcome::Value(i32::from(alpha))
     }
 
     fn ext_btn_set_anim(
@@ -8196,7 +8245,7 @@ impl ScriptRuntime {
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         match index {
-            0 | 1 | 2 => self.ext_se_play(assets, nls, resource_manager, audio),
+            0 | 1 | 2 => self.ext_se_play(index, assets, nls, resource_manager, audio),
             3 => self.ext_audio_stop(5, PalSoundGroup::GROUP4, audio),
             4 => {
                 let args = self.pop_ext_args(2);
@@ -12145,11 +12194,49 @@ impl ScriptRuntime {
 
     fn ext_se_play(
         &mut self,
+        index: u16,
         assets: &CoreAssets,
         nls: Nls,
         resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
+        if index == 0 {
+            let arity = if assets.extended_softpal { 3 } else { 2 };
+            let args = self.pop_ext_args(arity);
+            if args.len() < arity {
+                return ExtCallOutcome::Block;
+            }
+            let (slot, name_value) = if assets.extended_softpal {
+                (args[1], args[0])
+            } else {
+                (args[0], args[1])
+            };
+            return self.audio_load_and_play(
+                5,
+                slot,
+                PalSoundGroup::GROUP4,
+                name_value,
+                0,
+                100,
+                false,
+                None,
+                assets,
+                nls,
+                resource_manager,
+                audio,
+            );
+        }
+        if index == 1 && assets.extended_softpal {
+            let args = self.pop_ext_args(3);
+            if args.len() < 3 {
+                return ExtCallOutcome::Block;
+            }
+            let slot = args[0];
+            if let (Some(audio), Some(handle)) = (audio, self.game_audio.get(&(5, slot)).copied()) {
+                let _ = audio.play(handle, args[2] != 0);
+            }
+            return ExtCallOutcome::Value(1);
+        }
         let args = self.pop_ext_args(5);
         if args.len() < 5 {
             return ExtCallOutcome::Block;
@@ -15818,6 +15905,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn button_position_query_writes_requested_temporary_slots() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let mut desc = SpriteDesc::new(SceneTextureId(1), 200, 120);
+        desc.position = PalVec3::new(448, 376, 0);
+        let handle = sprites.create(desc);
+        runtime.game_buttons.insert(
+            (7, 0),
+            GameButtonEntry {
+                handle,
+                name: "button".to_owned(),
+                visible: true,
+                enabled: true,
+                locked: false,
+                toggle: 0,
+                alpha: 255,
+                slider_offset: 0,
+                hit_rect: None,
+                gosub_point: None,
+                anim_resource: None,
+                anim_play_flag: 0,
+            },
+        );
+        runtime.argument_base = 64;
+        runtime.write_temp_mem_absolute(0, i32::MIN + 1683);
+        runtime.stack = vec![99, 1, 0, 0, 7];
+        assert!(matches!(
+            runtime.ext_btn_get_pos(Some(&sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.temp_mem[0], 448);
+        assert_eq!(runtime.temp_mem[1], 376);
+        assert_eq!(runtime.stack, [99]);
+    }
+
+    #[test]
+    fn extended_pal_clock_advances_without_consuming_script_arguments() {
+        let empty_asset = |name: &str| LoadedAsset {
+            name: name.to_owned(),
+            bytes: Vec::new(),
+            source: AssetSource::Loose {
+                path: PathBuf::from(name),
+            },
+        };
+        let points = PointTable::parse(&[]).unwrap();
+        let assets = CoreAssets {
+            script: empty_asset("Script.src"),
+            file_dat: empty_asset("File.dat"),
+            text_dat: empty_asset("Text.dat"),
+            mem_dat: empty_asset("Mem.dat"),
+            point_dat: empty_asset("Point.dat"),
+            graphic_dat: None,
+            script_check_value: 0,
+            script_entry_pc: 12,
+            extended_softpal: false,
+            point_table: points.clone(),
+            graphic_index: None,
+        };
+        let mut runtime = ScriptRuntime::boot(12, ScriptRuntimeConfig::default());
+        runtime.stack.push(42);
+        runtime.set_pal_time(1_000);
+        let first =
+            runtime.dispatch_extcall(18, 121, &[], &assets, &points, None, None, None, None, None);
+        runtime.set_pal_time(1_088);
+        let second =
+            runtime.dispatch_extcall(18, 121, &[], &assets, &points, None, None, None, None, None);
+        assert!(matches!(first, ExtCallOutcome::Value(1_000)));
+        assert!(matches!(second, ExtCallOutcome::Value(1_088)));
+        assert_eq!(runtime.stack, [42]);
+    }
+
+    #[test]
     fn system_window_overlay_consumes_both_pal_argument_forms() {
         let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
         runtime.stack = vec![
@@ -15832,17 +15991,24 @@ mod tests {
             11439,
         ];
         assert!(matches!(
-            runtime.dispatch_misc_system_stub(4),
+            runtime.dispatch_misc_system_stub(4, false),
             ExtCallOutcome::Value(1)
         ));
         assert_eq!(runtime.stack, vec![77]);
 
         runtime.stack = vec![88, 1, 20, 11439];
         assert!(matches!(
-            runtime.dispatch_misc_system_stub(4),
+            runtime.dispatch_misc_system_stub(4, false),
             ExtCallOutcome::Value(1)
         ));
         assert_eq!(runtime.stack, vec![88]);
+
+        runtime.stack = vec![99, 4, 103, 102, 101, 0, 1, 23, 23212];
+        assert!(matches!(
+            runtime.dispatch_misc_system_stub(4, true),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, vec![99]);
     }
 
     #[test]

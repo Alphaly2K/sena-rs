@@ -90,6 +90,7 @@ fn assets_with_script(entry_pc: u32, script_body: Vec<u8>) -> CoreAssets {
         mem_dat: asset("Mem.dat", Vec::new()),
         point_dat: asset("Point.dat", Vec::new()),
         graphic_dat: None,
+        extended_softpal: false,
         script_check_value: 0,
         script_entry_pc: entry_pc,
         point_table: PointTable::parse(&[]).expect("empty Point.dat should parse"),
