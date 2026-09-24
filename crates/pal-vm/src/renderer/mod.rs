@@ -427,14 +427,23 @@ fn draw_textured_rect(
     let src_y = sprite.src.y * texture.height as f32;
     let src_w = sprite.src.w * texture.width as f32;
     let src_h = sprite.src.h * texture.height as f32;
-    let smooth_upscale = sprite.smooth_upscale
-        && (dst_rect.w > src_w * 1.1 || dst_rect.h > src_h * 1.1);
+    let smooth_upscale =
+        sprite.smooth_upscale && (dst_rect.w > src_w * 1.1 || dst_rect.h > src_h * 1.1);
     let source_bounds = [
-        sprite.source_rect[0].max(0),
-        sprite.source_rect[1].max(0),
-        sprite.source_rect[2].saturating_sub(1).min(texture.width as i32 - 1),
-        sprite.source_rect[3].saturating_sub(1).min(texture.height as i32 - 1),
+        sprite.source_rect[0].clamp(0, texture.width as i32 - 1),
+        sprite.source_rect[1].clamp(0, texture.height as i32 - 1),
+        sprite.source_rect[2]
+            .saturating_sub(1)
+            .clamp(0, texture.width as i32 - 1),
+        sprite.source_rect[3]
+            .saturating_sub(1)
+            .clamp(0, texture.height as i32 - 1),
     ];
+    if smooth_upscale
+        && (source_bounds[0] > source_bounds[2] || source_bounds[1] > source_bounds[3])
+    {
+        return;
+    }
     let tint = sprite.color;
     for y in y0..y1 {
         let v = ((y as f32 + 0.5 - dst_rect.y) / dst_rect.h).clamp(0.0, 1.0);
@@ -450,10 +459,12 @@ fn draw_textured_rect(
             } else {
                 let sx = (src_x + u * src_w)
                     .floor()
-                    .clamp(0.0, texture.width.saturating_sub(1) as f32) as usize;
+                    .clamp(0.0, texture.width.saturating_sub(1) as f32)
+                    as usize;
                 let sy = (src_y + v * src_h)
                     .floor()
-                    .clamp(0.0, texture.height.saturating_sub(1) as f32) as usize;
+                    .clamp(0.0, texture.height.saturating_sub(1) as f32)
+                    as usize;
                 let src_index = (sy * texture.width as usize + sx) * 4;
                 [
                     texture.pixels[src_index],
@@ -621,4 +632,72 @@ fn write_surface_png(
     }
     writer.write_image_data(&rgba)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_sprite(smooth_upscale: bool) -> SpriteDraw {
+        SpriteDraw {
+            texture_id: SceneTextureId(1),
+            smooth_upscale,
+            priority: 0,
+            dst: RectF::new(0.0, 0.0, 2.0, 1.0),
+            src: RectF::new(0.0, 0.0, 1.0, 1.0),
+            source_rect: [0, 0, 2, 1],
+            texture_size: [2, 1],
+            cell_size: [2, 1],
+            position: [0.0; 3],
+            offset: [0; 2],
+            color: [1.0; 4],
+            scale: 1.0,
+            rotation: [0.0; 3],
+            center_offset: [0.0; 2],
+            render_mode: 0,
+        }
+    }
+
+    #[test]
+    fn hidpi_ui_pixels_are_interpolated_without_repeating_pairs() {
+        let texture = CachedTexture {
+            generation: 1,
+            width: 2,
+            height: 1,
+            pixels: Arc::from([255, 0, 0, 255, 0, 0, 255, 255]),
+        };
+        let mut smooth = [0; 4];
+        draw_textured_rect(&mut smooth, 4, 1, &texture, [2.0, 1.0], &test_sprite(true));
+        assert_eq!(smooth[0], 0xFF0000);
+        assert_eq!(smooth[3], 0x0000FF);
+        assert_ne!(smooth[0], smooth[1]);
+        assert_ne!(smooth[2], smooth[3]);
+
+        let mut nearest = [0; 4];
+        draw_textured_rect(
+            &mut nearest,
+            4,
+            1,
+            &texture,
+            [2.0, 1.0],
+            &test_sprite(false),
+        );
+        assert_eq!(nearest, [0xFF0000, 0xFF0000, 0x0000FF, 0x0000FF]);
+    }
+
+    #[test]
+    fn hidpi_ui_sampling_avoids_transparent_color_bleed_and_adjacent_cells() {
+        let texture = CachedTexture {
+            generation: 1,
+            width: 2,
+            height: 1,
+            pixels: Arc::from([255, 0, 0, 255, 0, 0, 255, 0]),
+        };
+        let middle = sample_bilinear(&texture, 0.5, 0.0, [0, 0, 1, 0]);
+        assert_eq!(&middle[..3], &[255, 0, 0]);
+        assert!(middle[3] > 0 && middle[3] < 255);
+
+        let clipped = sample_bilinear(&texture, 0.75, 0.0, [0, 0, 0, 0]);
+        assert_eq!(clipped, [255, 0, 0, 255]);
+    }
 }
