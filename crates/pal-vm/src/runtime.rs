@@ -9287,17 +9287,12 @@ impl ScriptRuntime {
                 sprites.release(old);
             }
         }
-        if name.eq_ignore_ascii_case("BGM_SECRET") {
-            return self.create_solid_sprite(
-                sprites, slot, arg_count, raw_x, raw_y, raw_z, 0, 0, 0, &name,
-            );
-        }
         let asset = match open_resource_variant(resource_manager, &name, IMAGE_EXTENSIONS) {
             Ok(asset) => asset,
             Err(err) => {
-                if let Some((r, g, b)) = parse_solid_color_name(&name) {
+                if let Some((a, r, g, b)) = parse_solid_color_name_argb(&name) {
                     return self.create_solid_sprite(
-                        sprites, slot, arg_count, raw_x, raw_y, raw_z, r, g, b, &name,
+                        sprites, slot, arg_count, raw_x, raw_y, raw_z, a, r, g, b, &name,
                     );
                 }
                 log::warn!("[trace-sprite] sp_set slot={slot} name={name:?} open failed: {err}");
@@ -9719,14 +9714,15 @@ impl ScriptRuntime {
         raw_x: i32,
         raw_y: i32,
         raw_z: i32,
+        a: u8,
         r: u8,
         g: u8,
         b: u8,
         source_name: &str,
     ) -> ExtCallOutcome {
         let (logical_width, logical_height) = self.logical_size();
-        // Native synthetic color resources (`#AARRGGBB`, BK_BLACK/BK_WHITE,
-        // BGM_SECRET) are PAL-side solid surfaces.  Absolute negative
+        // Native synthetic color resources (`#AARRGGBB`, BK_BLACK/BK_WHITE)
+        // are PAL-side solid surfaces.  Absolute negative
         // placement is used for transition masks such as `#FFFFFFFF` at
         // (-200,-104); the backing surface must expand by that signed offset or
         // the right/bottom edge leaks the clear color during fades.  Keep
@@ -9748,7 +9744,7 @@ impl ScriptRuntime {
         );
         let mut pixels = vec![0u8; width as usize * height as usize * 4];
         for px in pixels.chunks_exact_mut(4) {
-            px.copy_from_slice(&[r, g, b, 255]);
+            px.copy_from_slice(&[r, g, b, a]);
         }
         let surface_id = sprites.allocate_surface_id();
         let surface = match SpriteSurface::rgba8(surface_id, 1, width, height, pixels) {
@@ -9760,7 +9756,7 @@ impl ScriptRuntime {
         };
         sprites.insert_surface(surface);
         let mut desc = SpriteDesc::new(SceneTextureId(surface_id.0), width, height);
-        // `BGM_SECRET`, `BK_BLACK`, and `BK_WHITE` are compatibility stand-ins
+        // `BK_BLACK` and `BK_WHITE` are compatibility stand-ins
         // for PAL-side full-screen mask resources that are absent from the
         // testcase archive.  Native scripts still drive their wrapper with
         // sprite scale/position extcalls, but the portable renderer must keep
@@ -11479,11 +11475,11 @@ impl ScriptRuntime {
             return ExtCallOutcome::Value(1);
         }
 
-        let source = if let Some((r, g, b)) = parse_solid_color_name(&name) {
+        let source = if let Some((a, r, g, b)) = parse_solid_color_name_argb(&name) {
             let (logical_width, logical_height) = self.logical_size();
             let mut pixels = vec![0u8; logical_width as usize * logical_height as usize * 4];
             for px in pixels.chunks_exact_mut(4) {
-                px.copy_from_slice(&[r, g, b, 255]);
+                px.copy_from_slice(&[r, g, b, a]);
             }
             let surface_id = sprites.allocate_surface_id();
             let Ok(surface) =
@@ -13185,6 +13181,7 @@ impl ScriptRuntime {
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(2);
         let slot = args.first().copied().unwrap_or(-1);
+        log::debug!("[trace-audio] stop category={category} slot={slot}");
         let Some(audio) = audio else {
             return ExtCallOutcome::Value(1);
         };
@@ -13304,6 +13301,29 @@ impl ScriptRuntime {
                 "[trace-audio] open category={category} slot={slot} sentinel=# action=noop"
             );
             return ExtCallOutcome::Value(slot);
+        }
+        // Title and menu scripts can request the current looping BGM again on
+        // return. Keep its playback position when the requested track and loop
+        // region are unchanged. Explicit stops clear the slot, and a finished
+        // one-shot is allowed to start again.
+        if category == 4 && play {
+            if let (Some(state), Some(handle), Some(audio)) = (
+                self.bgm_slots.get(&slot),
+                self.game_audio.get(&(category, slot)),
+                audio.as_ref(),
+            ) {
+                if state.playing
+                    && state.name.eq_ignore_ascii_case(&name)
+                    && state.looping == (flags & 1 != 0)
+                    && state.loop_samples == loop_samples
+                    && (!audio.is_enabled() || audio.is_playing(*handle).unwrap_or(false))
+                {
+                    log::debug!(
+                        "[trace-audio] bgm reuse slot={slot} name={name:?} action=keep_playback"
+                    );
+                    return ExtCallOutcome::Value(slot);
+                }
+            }
         }
         if self.load_named_audio(
             category,
@@ -13878,12 +13898,15 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Game category 18 index 12 (`sub_41EAC0`) pops one dynamic string handle
-    /// and returns its byte length.  The native handler only counts values with
-    /// the dynamic-string tag; the portable VM also resolves Text.dat ids for
-    /// robustness in decompiled table helpers.
+    /// Game category 18 index 12 returns the length of a dynamic string. Some
+    /// Koikake callsites carry seven `0x0FFF_FFFF` filler operands below the
+    /// string handle; leave the caller's argument-frame marker intact.
     fn ext_string_length(&mut self, assets: &CoreAssets, nls: Nls) -> ExtCallOutcome {
-        let args = self.pop_ext_args(1);
+        let padded = self.stack.len() >= 8
+            && self.stack[self.stack.len() - 8..self.stack.len() - 1]
+                .iter()
+                .all(|&value| value == 0x0FFF_FFFF);
+        let args = self.pop_ext_args(if padded { 8 } else { 1 });
         let Some(value) = args.first().copied() else {
             return ExtCallOutcome::Value(0);
         };
@@ -15123,36 +15146,8 @@ fn is_named_animation_resource(name: &str) -> bool {
     })
 }
 
-fn parse_solid_color_name(name: &str) -> Option<(u8, u8, u8)> {
-    if name.eq_ignore_ascii_case("BK_BLACK") {
-        return Some((0, 0, 0));
-    }
-    if name.eq_ignore_ascii_case("BGM_SECRET") {
-        return Some((0, 0, 0));
-    }
-    if name.eq_ignore_ascii_case("BK_WHITE") {
-        return Some((255, 255, 255));
-    }
-    let hex = name.strip_prefix('#').unwrap_or(name);
-    let raw = u32::from_str_radix(hex, 16).ok()?;
-    match hex.len() {
-        6 => Some((
-            ((raw >> 16) & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            (raw & 0xFF) as u8,
-        )),
-        8 => Some((
-            ((raw >> 16) & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            (raw & 0xFF) as u8,
-        )),
-        _ => None,
-    }
-}
-
 fn is_fullscreen_solid_layer(name: &str) -> bool {
-    name.eq_ignore_ascii_case("BGM_SECRET")
-        || name.eq_ignore_ascii_case("BK_BLACK")
+    name.eq_ignore_ascii_case("BK_BLACK")
         || name.eq_ignore_ascii_case("BK_WHITE")
 }
 
@@ -15168,7 +15163,7 @@ fn parse_solid_color_name_argb(name: &str) -> Option<(u8, u8, u8, u8)> {
     if name == "#" {
         return Some((0, 0, 0, 0));
     }
-    if name.eq_ignore_ascii_case("BK_BLACK") || name.eq_ignore_ascii_case("BGM_SECRET") {
+    if name.eq_ignore_ascii_case("BK_BLACK") {
         return Some((255, 0, 0, 0));
     }
     if name.eq_ignore_ascii_case("BK_WHITE") {

@@ -4262,6 +4262,9 @@ static SIG_ARG_GET: ExtSig = sig!(18, 6, "string_alloc", pop=1,
 ///   copies the string into a local buffer, strlen()s it, and writes the length.
 /// - Disassembly: docs/dis.txt 0005D420 and later callsites use the returned
 ///   value as a loop/condition result.
+/// - Koikake runtime trace: some callsites push seven `0x0FFF_FFFF` fillers
+///   immediately before the value. Its runtime consumes that padded form so
+///   the fillers cannot displace the caller's argument-frame marker.
 ///
 /// Engine: Verified — pops one value, resolves it, and returns byte length.
 ///
