@@ -424,6 +424,11 @@ pub struct ScriptRuntime {
     /// Per-character voice volumes set from the SOUND menu's right-hand unit
     /// grid (category 13 indexes 11/12 take the character slot).
     voice_ex_volume_percent: BTreeMap<i32, i32>,
+    /// Per-character voice enable latches from the unit grid's mute checks
+    /// (category 13 index 5 takes (slot, enabled, extra); index 6 reads slot).
+    voice_ex_enabled: BTreeMap<i32, bool>,
+    /// `Sound.csv` voice-header rows in unit-grid slot order, loaded once.
+    voice_unit_headers: Option<Vec<String>>,
     se_muted: BTreeMap<i32, bool>,
     /// Native voice_wait stores a wait mask and rewinds PC until the voice checker reports idle.
     pending_voice_wait_slot: Option<i32>,
@@ -1281,6 +1286,8 @@ impl ScriptRuntime {
             se_volume_percent: BTreeMap::new(),
             se_enabled: BTreeMap::new(),
             voice_ex_volume_percent: BTreeMap::new(),
+            voice_ex_enabled: BTreeMap::new(),
+            voice_unit_headers: None,
             se_muted: BTreeMap::new(),
             pending_voice_wait_slot: None,
             font_state: PalFontSystem::new(),
@@ -1379,6 +1386,10 @@ impl ScriptRuntime {
                         if let Ok(slot) = slot.parse::<i32>() {
                             self.voice_ex_volume_percent.insert(slot, clamp_percent(value));
                         }
+                    } else if let Some(slot) = key.strip_prefix("voice_ex_enabled_") {
+                        if let Ok(slot) = slot.parse::<i32>() {
+                            self.voice_ex_enabled.insert(slot, value != 0);
+                        }
                     }
                 }
             }
@@ -1450,6 +1461,9 @@ impl ScriptRuntime {
         }
         for (slot, percent) in &self.voice_ex_volume_percent {
             text.push_str(&format!("voice_ex_volume_percent_{slot}={percent}\n"));
+        }
+        for (slot, enabled) in &self.voice_ex_enabled {
+            text.push_str(&format!("voice_ex_enabled_{slot}={}\n", i32::from(*enabled)));
         }
         std::fs::write(&path, text)?;
         log::debug!("[trace-save] wrote portable system data {}", path.display());
@@ -2437,7 +2451,7 @@ impl ScriptRuntime {
         voice_value: i32,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) {
         if voice_value == 0x0FFF_FFFF || !self.text_state.voice_enabled {
@@ -2460,13 +2474,18 @@ impl ScriptRuntime {
             log::debug!("[trace-audio] text_voice skip name={name:?}");
             return;
         }
+        let unit_percent = resource_manager
+            .as_deref_mut()
+            .and_then(|rm| self.voice_unit_slot_for_name(rm, &name))
+            .map(|slot| self.voice_unit_channel_percent(slot))
+            .unwrap_or(100);
         let outcome = self.audio_load_and_play(
             13,
             0,
             PalSoundGroup::GROUP1,
             voice_value,
             0,
-            100,
+            unit_percent,
             true,
             None,
             assets,
@@ -8923,13 +8942,34 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             5 => {
-                let args = self.pop_ext_args(1);
-                self.text_state.voice_enabled = args.first().copied().unwrap_or(1) != 0;
+                // voice_enable(slot, enabled, extra): category 13 index 5 is
+                // observed popping three values; the SOUND menu per-character
+                // mute checks drive it with the unit slot.  Negative slots keep
+                // the historical global latch behavior.
+                let args = self.pop_ext_args(3);
+                let slot = args.first().copied().unwrap_or(-1);
+                let enabled = args.get(1).copied().unwrap_or(1) != 0;
+                if slot < 0 {
+                    self.text_state.voice_enabled = enabled;
+                } else {
+                    self.voice_ex_enabled.insert(slot, enabled);
+                }
                 ExtCallOutcome::Value(1)
             }
             6 | 13 => {
-                self.pop_ext_args(0);
-                ExtCallOutcome::Value(i32::from(self.text_state.voice_enabled))
+                // is_voice_enable(slot): per-slot answer when the unit grid
+                // queries a character, global latch for negative slots.
+                let args = self.pop_ext_args(1);
+                let slot = args.first().copied().unwrap_or(-1);
+                let enabled = if slot < 0 {
+                    self.text_state.voice_enabled
+                } else {
+                    self.voice_ex_enabled
+                        .get(&slot)
+                        .copied()
+                        .unwrap_or(self.text_state.voice_enabled)
+                };
+                ExtCallOutcome::Value(i32::from(enabled))
             }
             7 => {
                 // Game.exe 0x444190 (`VmExtcall_VoicePlayFade`) pops one value
@@ -12991,6 +13031,7 @@ impl ScriptRuntime {
     }
 
     fn apply_bgm_group_volume(&self, audio: Option<&mut AudioSystem>) {
+
         if let Some(audio) = audio {
             let volume = if self.bgm_muted {
                 PalVolume::MIN
@@ -13109,11 +13150,92 @@ impl ScriptRuntime {
         )
     }
 
+    /// Load the `[sound] SOUND_UNIT_LISTFILE` voice registry once.  Each row is
+    /// `"header","test_voice",registered` in unit-grid slot order; pseudo
+    /// headers -1/-2/-3 are the vo99/vo98/vo97 catch-all buckets.
+    fn ensure_voice_unit_headers(&mut self, resource_manager: &mut ResourceManager) {
+        if self.voice_unit_headers.is_some() {
+            return;
+        }
+        let list_name = self
+            .system_ini(Some(resource_manager))
+            .and_then(|ini| ini.get("sound"))
+            .and_then(|section| section.get("sound_unit_listfile"))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "Sound.csv".to_owned());
+        let headers = match resource_manager.open(&list_name) {
+            Ok(asset) => match resource_manager.nls().decode(&asset.bytes) {
+                Ok(text) => text
+                    .lines()
+                    .filter_map(|line| {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with("//") {
+                            return None;
+                        }
+                        let header = line.split(',').next()?.trim().trim_matches('"');
+                        Some(header.to_owned())
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+        self.voice_unit_headers = Some(headers);
+    }
+
+    /// Map a voice resource name (`vo01_xxxxx`) to its unit-grid slot through
+    /// the `Sound.csv` headers.  Unmatched `vo97`/`vo98`/`vo99` fall into the
+    /// -3/-2/-1 catch-all rows; anything else yields `None`.
+    fn voice_unit_slot_for_name(
+        &mut self,
+        resource_manager: &mut ResourceManager,
+        name: &str,
+    ) -> Option<i32> {
+        self.ensure_voice_unit_headers(resource_manager);
+        let headers = self.voice_unit_headers.as_deref()?;
+        if headers.is_empty() {
+            return None;
+        }
+        let lower = name.to_ascii_lowercase();
+        let mut best: Option<(usize, usize)> = None;
+        for (index, header) in headers.iter().enumerate() {
+            let header = header.to_ascii_lowercase();
+            let prefix = match header.parse::<i32>() {
+                // Pseudo headers address the catch-all voice prefixes.
+                Ok(-1) => "vo99".to_owned(),
+                Ok(-2) => "vo98".to_owned(),
+                Ok(-3) => "vo97".to_owned(),
+                Ok(_) => continue,
+                Err(_) => header,
+            };
+            if lower.starts_with(&prefix)
+                && best.is_none_or(|(_, len)| prefix.len() > len)
+            {
+                best = Some((index, prefix.len()));
+            }
+        }
+        best.map(|(index, _)| index as i32)
+    }
+
+    /// Effective per-channel voice percent for a unit slot: 0 when the
+    /// character's voice is muted, otherwise its configured percent (default
+    /// 100, neutral against the global group volume).
+    fn voice_unit_channel_percent(&self, slot: i32) -> i32 {
+        if self.voice_ex_enabled.get(&slot).copied() == Some(false) {
+            return 0;
+        }
+        self.voice_ex_volume_percent
+            .get(&slot)
+            .copied()
+            .unwrap_or(100)
+            .clamp(0, 100)
+    }
+
     fn ext_voice_play(
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(4);
@@ -13132,13 +13254,23 @@ impl ScriptRuntime {
         // channel volume makes the common `voice_play(..., fade_ms=0)` path
         // fully silent.
         let _fade_ms = args[3];
+        // Per-character volume/mute from the SOUND unit grid rides the PAL
+        // channel volume so it composes with the group-wide voice volume.
+        let unit_percent = self
+            .resolve_resource_string(args[1], assets, nls)
+            .zip(resource_manager.as_deref_mut())
+            .and_then(|(name, rm)| {
+                self.voice_unit_slot_for_name(rm, &name)
+                    .map(|slot| self.voice_unit_channel_percent(slot))
+            })
+            .unwrap_or(100);
         self.audio_load_and_play(
             13,
             slot,
             PalSoundGroup::GROUP1,
             args[1],
             args[2],
-            100,
+            unit_percent,
             true,
             None,
             assets,
