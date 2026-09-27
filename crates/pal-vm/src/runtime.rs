@@ -8605,18 +8605,17 @@ impl ScriptRuntime {
 
     /// `btn_lock(group,duration_ms)` matches Game.exe sub_40E0C0.  Native state
     /// is group-scoped: it stores a lock flag, duration/timer value, and start
-    /// time, with `duration_ms == 0` storing a zero start time.  That zero case
-    /// is used around menu redraws and must not become a permanent per-entry
-    /// disable in the portable button table; otherwise SYSTEM/SOUND/LOAD tabs
-    /// accept one click and then stop reacting.
+    /// time.  Koikake locks with `duration_ms == 0` around menu transitions
+    /// (title menu handler, settings/save screen entry) and pairs every one
+    /// with `btn_unlock` at the end of the transition, so the zero case means
+    /// "locked until btn_unlock", not "no lock": the shared title-menu handler
+    /// depends on it to block re-entrant clicks while it is still running.
     fn ext_btn_lock(&mut self) -> ExtCallOutcome {
         let args = self.pop_ext_args(2);
         let group = args.first().copied().unwrap_or(-1);
         let duration_ms = args.get(1).copied().unwrap_or(0);
-        if duration_ms > 0 {
-            for entry in self.matching_button_entries_mut(group, -1) {
-                entry.locked = true;
-            }
+        for entry in self.matching_button_entries_mut(group, -1) {
+            entry.locked = true;
         }
         log::debug!("[trace-button] btn_lock group={group} duration_ms={duration_ms}");
         ExtCallOutcome::Value(1)

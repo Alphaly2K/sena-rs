@@ -51,7 +51,7 @@ pub use debug::{
 };
 pub use effect::{PalEffectState, PalEffectSystem};
 pub use engine::{Engine, EngineConfig, EngineFrame, FrameTiming, TraceConfig};
-pub use event::{InputEvent, PalEvent};
+pub use event::{InputEvent, MouseButton, PalEvent};
 pub use font::{PalFontFallback, PalFontSystem};
 pub use input::{PalInputState, PalKey, PalMouseButton};
 pub use list::{PalListHandle, PalListSystem};

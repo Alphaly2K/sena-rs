@@ -4,7 +4,7 @@ use clap::Parser;
 use pal_asset::Nls;
 use pal_vm::{
     run_sena, AudioConfig, DiagnosticAutoAdvance, DiagnosticClick, DiagnosticClickWhenHitEnabled,
-    DiagnosticKeyEvent, DiagnosticPngAt, FrameScene, ScriptRuntimeConfig, SenaConfig,
+    DiagnosticKeyEvent, DiagnosticPngAt, FrameScene, MouseButton, ScriptRuntimeConfig, SenaConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -110,6 +110,10 @@ struct Args {
     #[arg(long, value_parser = parse_diagnostic_click)]
     diagnostic_click: Vec<DiagnosticClick>,
 
+    /// Inject headless right-button clicks as frame:x:y in PAL logical coordinates.
+    #[arg(long, value_parser = parse_diagnostic_right_click)]
+    diagnostic_right_click: Vec<DiagnosticClick>,
+
     /// Inject one click at x:y once that logical point hits an enabled button.
     #[arg(long, value_parser = parse_diagnostic_click_when_hit_enabled)]
     diagnostic_click_when_hit_enabled: Vec<DiagnosticClickWhenHitEnabled>,
@@ -179,7 +183,12 @@ fn main() -> anyhow::Result<()> {
         diagnostic_png: args.diagnostic_png,
         diagnostic_png_at: args.diagnostic_png_at,
         window_dump_frame_at: args.window_dump_frame_at,
-        diagnostic_clicks: args.diagnostic_click,
+        diagnostic_clicks: args
+            .diagnostic_click
+            .iter()
+            .copied()
+            .chain(args.diagnostic_right_click.iter().copied())
+            .collect(),
         diagnostic_click_when_hit_enabled: args.diagnostic_click_when_hit_enabled,
         diagnostic_key_events,
         diagnostic_auto_advance,
@@ -219,7 +228,18 @@ fn parse_diagnostic_click(raw: &str) -> Result<DiagnosticClick, String> {
     if parts.next().is_some() {
         return Err("expected frame:x:y".to_owned());
     }
-    Ok(DiagnosticClick { frame, x, y })
+    Ok(DiagnosticClick {
+        frame,
+        x,
+        y,
+        button: MouseButton::Left,
+    })
+}
+
+fn parse_diagnostic_right_click(raw: &str) -> Result<DiagnosticClick, String> {
+    let mut click = parse_diagnostic_click(raw)?;
+    click.button = MouseButton::Right;
+    Ok(click)
 }
 
 fn parse_diagnostic_click_when_hit_enabled(

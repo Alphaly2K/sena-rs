@@ -56,6 +56,7 @@ pub struct DiagnosticClick {
     pub frame: usize,
     pub x: i32,
     pub y: i32,
+    pub button: MouseButton,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,16 +180,16 @@ pub fn run_sena_headless(config: SenaConfig) -> anyhow::Result<()> {
                     y: click.y as f64,
                 }));
                 engine.handle_event(PalEvent::Input(InputEvent::MouseInput {
-                    button: MouseButton::Left,
+                    button: click.button,
                     pressed: true,
                 }));
                 eprintln!(
-                    "[headless] injected click press frame={} pos=({}, {})",
-                    frame_index, click.x, click.y
+                    "[headless] injected click press frame={} pos=({}, {}) button={:?}",
+                    frame_index, click.x, click.y, click.button
                 );
             } else if frame_index == click.frame.saturating_add(1) {
                 engine.handle_event(PalEvent::Input(InputEvent::MouseInput {
-                    button: MouseButton::Left,
+                    button: click.button,
                     pressed: false,
                 }));
                 eprintln!("[headless] injected click release frame={frame_index}");
@@ -415,7 +416,7 @@ impl SenaApplication {
                     .handle_event(PalEvent::Input(InputEvent::CursorMoved { x, y }));
                 self.engine
                     .handle_event(PalEvent::Input(InputEvent::MouseInput {
-                        button: MouseButton::Left,
+                        button: click.button,
                         pressed: true,
                     }));
                 eprintln!(
@@ -425,7 +426,7 @@ impl SenaApplication {
             } else if frame_index == click.frame.saturating_add(1) {
                 self.engine
                     .handle_event(PalEvent::Input(InputEvent::MouseInput {
-                        button: MouseButton::Left,
+                        button: click.button,
                         pressed: false,
                     }));
                 eprintln!("[window-diagnostic] injected click release frame={frame_index}");
