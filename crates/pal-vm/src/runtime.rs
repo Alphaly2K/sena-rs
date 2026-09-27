@@ -158,13 +158,30 @@ fn button_render_priority(index: i32, cursor: i32) -> i32 {
     index.saturating_sub(0x1302i32.saturating_add(cursor))
 }
 
-// Synthetic ADV text and save drawings still use separate sprites rather than
-// pixels painted into their native surfaces. This is not btn_set's depth.
-const BUTTON_RENDER_PRIORITY: i32 = 100;
+// The PAL text window sits between the two native layers: in front of scene
+// sprites (0x1387 - slot) and behind the button layer (0x1302 - index), so
+// native depth 0x1330 keeps scene slots below 87 under the window while the
+// ADV chrome stays clickable-looking above it.  Only a positive cursor moves
+// the window: negative popup lanes must stay above the text even if a reveal
+// recomposes while a menu is open.
+fn adv_text_render_priority(cursor: i32) -> i32 {
+    0i32.saturating_sub(0x1330).saturating_sub(cursor.max(0))
+}
 
-// `thumbnail_set` and the save text draw calls paint onto a shared canvas in
-// PAL; the separate sprites in this renderer must sit above that canvas.
-const SAVE_DRAWING_PRIORITY: i32 = BUTTON_RENDER_PRIORITY + 1;
+// The backlog overlay is drawn while the log screen is open, and the script
+// has already moved the priority cursor down for that screen (Koikake opens
+// it at cursor -134, where the background sprite sits at depth 4801 and the
+// screen buttons at 4710..4712).  Unlike the ADV window the overlay must
+// follow negative lanes, or the log background covers the backlog text.
+fn history_text_render_priority(cursor: i32) -> i32 {
+    0i32.saturating_sub(0x1330)
+        .saturating_sub(cursor)
+        .saturating_add(1)
+}
+
+// Kept for tests that need a neutral priority above the synthetic bands.
+#[cfg(test)]
+const BUTTON_RENDER_PRIORITY: i32 = 100;
 
 #[derive(Clone, Debug)]
 pub enum FrameEvent {
@@ -1980,8 +1997,9 @@ impl ScriptRuntime {
             });
             if let Some((width, height, rgba, x, y)) = composed {
                 // Native PAL draws ADV text windows above scene sprites but
-                // below the Game.exe button layer.
-                let z = 90;
+                // below the Game.exe button layer; the synthetic sprite must
+                // join the native depth band or it buries the ADV chrome.
+                let z = adv_text_render_priority(self.sprite_priority_cursor);
                 let position_z = 0;
                 if let Some(handle) = self.text_state.sprite {
                     let _ = sprites.replace_sprite_surface(
@@ -2162,9 +2180,31 @@ impl ScriptRuntime {
         }
         .saturating_add(text_leading as i32);
         // The native name text is painted over the nameplate/VOICE button
-        // surface. That button lives on the button render lane, so z+1
-        // would leave the name underneath its own background.
-        let name_z = BUTTON_RENDER_PRIORITY + 1;
+        // surface. Anchor the synthetic sprite just above whichever visible
+        // ADV chrome button sits under the name origin, so popup screens and
+        // their lanes still cover the name when the text window is hidden.
+        let name_z = self
+            .game_buttons
+            .iter()
+            .filter(|((group, _), entry)| *group == 0 && entry.visible)
+            .filter_map(|(_, entry)| {
+                let sprite = sprites.get(entry.handle)?;
+                if !sprite.visible {
+                    return None;
+                }
+                let pos = sprite.effective_position();
+                let right = pos.x.saturating_add(sprite.source_rect.width());
+                let bottom = pos.y.saturating_add(sprite.source_rect.height());
+                let center_x = name_x.saturating_add(name_surface_width as i32 / 2);
+                let center_y = name_y.saturating_add(name_surface_height as i32 / 2);
+                (center_x >= pos.x && center_x < right && center_y >= pos.y && center_y < bottom)
+                    .then(|| sprite.effective_priority())
+            })
+            .max()
+            .map(|priority| priority.saturating_add(1))
+            .unwrap_or_else(|| {
+                adv_text_render_priority(self.sprite_priority_cursor).saturating_add(1)
+            });
         let position_z = 0;
         if let Some(handle) = self.text_state.name_sprite {
             let _ = sprites.replace_sprite_surface(
@@ -2390,7 +2430,9 @@ impl ScriptRuntime {
         self.font_state.set_font_size(saved_size);
         self.font_state.set_color(saved_color.0, saved_color.1);
 
-        let z = 95;
+        // The backlog overlays the ADV text window but stays under the native
+        // button layer, following the popup lane the log screen opened on.
+        let z = history_text_render_priority(self.sprite_priority_cursor);
         if let Some(handle) = self.history_state.sprite {
             let _ = sprites.replace_sprite_surface(handle, width, height, rgba, "history:text");
             let _ = sprites.set_pos(handle, left, top, 0);
@@ -4007,7 +4049,11 @@ impl ScriptRuntime {
         if let Some(name) = ext_opcode(category, index).and_then(|opcode| opcode.name) {
             match name {
                 "text_init" => {
-                    return self.dispatch_text_stub(0, assets, nls, resource_manager, audio)
+                    // Scripts only re-run text_init as part of a full UI
+                    // re-init (boot, return to title). Drop buttons left
+                    // behind by abandoned screens before they rebuild.
+                    self.clear_all_buttons(sprites);
+                    return self.dispatch_text_stub(0, assets, nls, resource_manager, audio);
                 }
                 "text_set_icon" => {
                     return self.dispatch_text_stub(1, assets, nls, resource_manager, audio)
@@ -4374,20 +4420,27 @@ impl ScriptRuntime {
             // expires or the native cancel path completes.
             0 => {
                 let args = self.pop_ext_args(2);
-                let duration_ms = args.first().copied().unwrap_or(1).max(1);
+                let duration_ms = args.first().copied().unwrap_or(1);
                 let skip_cancel = args.get(1).copied().unwrap_or(0);
                 log::debug!("[trace-script] wait duration_ms={duration_ms}");
                 if skip_cancel != 0 {
                     log::debug!("[trace-script] wait skip_cancel={skip_cancel}");
                 }
-                ExtCallOutcome::Wait {
-                    value: 1,
-                    request: if skip_cancel != 0 {
-                        WaitRequest::ClickOrTime(duration_ms as u32)
+                let request = if skip_cancel != 0 {
+                    if duration_ms < 0 {
+                        // No timeout: only the cancel (click) path completes
+                        // the wait.  Koikake's HIDE button callback uses
+                        // wait(-1, 1) to park until the player clicks the
+                        // text window back; clamping -1 to 1ms restored the
+                        // window on the very next frame.
+                        WaitRequest::Click
                     } else {
-                        WaitRequest::Time(duration_ms as u32)
-                    },
-                }
+                        WaitRequest::ClickOrTime(duration_ms.max(1) as u32)
+                    }
+                } else {
+                    WaitRequest::Time(duration_ms.max(1) as u32)
+                };
+                ExtCallOutcome::Wait { value: 1, request }
             }
             // wait_click(duration_ms): Game.exe sub_444DE0 uses -1 as the
             // native text-task completion branch (ctx[1050] clear or
@@ -6078,6 +6131,20 @@ impl ScriptRuntime {
         Ok(path)
     }
 
+    /// `thumbnail_set` and the save text draw calls blit into the target
+    /// sprite slot's canvas surface in native PAL, so the pixels inherit that
+    /// canvas layer: the slot plates stay underneath and a later popup lane
+    /// (cursor moved down before `btn_set`) covers them.  These drawings are
+    /// separate sprites in this renderer, so they must copy the canvas
+    /// sprite's depth instead of floating on a fixed top band.
+    fn save_drawing_priority(&self, sprites: &SpriteSystem, slot: i32) -> i32 {
+        self.game_sprites
+            .get(&slot)
+            .and_then(|handle| sprites.get(*handle))
+            .map(|sprite| sprite.effective_priority())
+            .unwrap_or_else(|| game_sprite_priority(slot, self.sprite_priority_cursor))
+    }
+
     /// `thumbnail_set` pops `(slot, save_slot, x, y)` and blits the stored
     /// thumbnail RGBA onto that sprite. Missing files still return 1.
     fn ext_thumbnail_set(
@@ -6118,12 +6185,13 @@ impl ScriptRuntime {
         if pixels.len() != expected {
             pixels.resize(expected, 0);
         }
+        let priority = self.save_drawing_priority(sprites, slot);
         let Some(handle) = sprites.create_rgba_sprite(
             width,
             height,
             pixels,
             PalVec3::from_f32(x as f32, y as f32, 0.0),
-            SAVE_DRAWING_PRIORITY,
+            priority,
             format!("thumbnail:{save_slot}"),
         ) else {
             return ExtCallOutcome::Value(0);
@@ -6337,6 +6405,7 @@ impl ScriptRuntime {
             .set_font_size(self.save_state.font_size.max(18) as u16);
         let (width, height, rgba) = self.font_state.rasterize(&text);
         self.font_state.set_font_size(saved_size);
+        let priority = self.save_drawing_priority(sprites, sprite_slot);
         if let Some(handle) = self
             .save_state
             .text_sprites
@@ -6351,14 +6420,14 @@ impl ScriptRuntime {
                 format!("save-time:{filename}:{text}"),
             );
             let _ = sprites.set_pos(handle, x, y, 0);
-            let _ = sprites.set_priority(handle, SAVE_DRAWING_PRIORITY);
+            let _ = sprites.set_priority(handle, priority);
             let _ = sprites.view_ctrl(handle, true);
         } else if let Some(handle) = sprites.create_rgba_sprite(
             width,
             height,
             rgba,
             PalVec3::new(x, y, 0),
-            SAVE_DRAWING_PRIORITY,
+            priority,
             format!("save-time:{filename}:{text}"),
         ) {
             self.save_state
@@ -6450,6 +6519,7 @@ impl ScriptRuntime {
             .set_font_size(self.save_state.font_size.max(16) as u16);
         let (width, height, rgba) = self.font_state.rasterize(text);
         self.font_state.set_font_size(saved_size);
+        let priority = self.save_drawing_priority(sprites, sprite_slot);
         if let Some(handle) = self
             .save_state
             .text_sprites
@@ -6464,14 +6534,14 @@ impl ScriptRuntime {
                 format!("{label}:{text}"),
             );
             let _ = sprites.set_pos(handle, x, y, 0);
-            let _ = sprites.set_priority(handle, SAVE_DRAWING_PRIORITY);
+            let _ = sprites.set_priority(handle, priority);
             let _ = sprites.view_ctrl(handle, true);
         } else if let Some(handle) = sprites.create_rgba_sprite(
             width,
             height,
             rgba,
             PalVec3::new(x, y, 0),
-            SAVE_DRAWING_PRIORITY,
+            priority,
             format!("{label}:{text}"),
         ) {
             self.save_state
@@ -8083,6 +8153,31 @@ impl ScriptRuntime {
             "[trace-button] btn_set group={group} index={index} name={name:?} asset={source_name:?} size={log_size} entry_flag={entry_flag} gosub_point={gosub_point:?}",
         );
         ExtCallOutcome::Value(1)
+    }
+
+    /// Release every registered button group and its sprites. Scripts re-run
+    /// the boot-time global init (text_init et al.) when long-jumping back to
+    /// the title; that path never btn_uninits the abandoned screen groups, so
+    /// their buttons would linger over the title and steal its clicks.
+    fn clear_all_buttons(&mut self, sprites: Option<&mut SpriteSystem>) {
+        if self.game_buttons.is_empty() && self.button_groups.is_empty() {
+            return;
+        }
+        if let Some(sprites) = sprites {
+            let handles = self
+                .game_buttons
+                .values()
+                .map(|entry| entry.handle)
+                .collect::<Vec<_>>();
+            for handle in handles {
+                sprites.release(handle);
+            }
+        }
+        self.game_buttons.clear();
+        self.button_groups.clear();
+        self.button_push_queue.clear();
+        self.adv_menu_expanded = false;
+        log::debug!("[trace-button] clear_all_buttons");
     }
 
     /// Game category 8 index 0 (`sub_40FC60`) pops
@@ -10545,6 +10640,10 @@ impl ScriptRuntime {
         if slot == -1 {
             self.game_msprites.clear();
             self.msprite_system.clear();
+            // The priority cursor is sprite-system state; a full clear resets
+            // it or screens abandoned via script long jumps (e.g. Koikake's
+            // save-screen -> title return) leave later sprites on stale lanes.
+            self.sprite_priority_cursor = 0;
             self.game_sprite_placements.clear();
             self.game_sprite_native_scales.clear();
             self.game_sprite_wrapper_visuals.clear();
@@ -17138,6 +17237,46 @@ mod tests {
     }
 
     #[test]
+    fn adv_text_layer_stays_under_buttons_and_over_scene_sprites() {
+        for cursor in [0, 134, 5000] {
+            let text = adv_text_render_priority(cursor);
+            assert!(
+                text > game_sprite_priority(80, cursor),
+                "text window must cover low-slot scene sprites (cursor={cursor})"
+            );
+            assert!(
+                text < button_render_priority(0, cursor),
+                "button layer must cover the text window (cursor={cursor})"
+            );
+        }
+        // Negative popup lanes bring their own content forward; the text
+        // window must not follow them up or a mid-reveal recompose would
+        // paint it over the popup.
+        assert_eq!(adv_text_render_priority(-268), adv_text_render_priority(0));
+    }
+
+    #[test]
+    fn history_text_follows_popup_lane_between_sprites_and_buttons() {
+        // Koikake opens the log screen at cursor -134: LOG_BASE lands on
+        // sprite slot 64 and the screen buttons start at index 20.
+        let cursor = -134;
+        let history = history_text_render_priority(cursor);
+        assert!(
+            history > game_sprite_priority(64, cursor),
+            "backlog text must cover the log screen background"
+        );
+        assert!(
+            history < button_render_priority(20, cursor),
+            "log screen buttons must cover the backlog text"
+        );
+        // Outside a popup lane the backlog stays just above the text window.
+        assert_eq!(
+            history_text_render_priority(0),
+            adv_text_render_priority(0) + 1
+        );
+    }
+
+    #[test]
     fn inline_quick_buttons_follow_toolbar_alpha() {
         let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
         let mut sprites = SpriteSystem::new();
@@ -17732,6 +17871,21 @@ mod tests {
         let mut manager = ResourceManager::new(&root, Nls::ShiftJis);
         let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
         let mut sprites = SpriteSystem::new();
+        // Native scripts paint save drawings into a canvas sprite slot.  The
+        // drawing sprites must inherit that canvas layer instead of floating
+        // on a fixed band above popup dialogs.
+        let canvas_priority = game_sprite_priority(77, -268);
+        let canvas = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![0; 16],
+                PalVec3::new(0, 0, 0),
+                canvas_priority,
+                "sp_create:77",
+            )
+            .unwrap();
+        runtime.game_sprites.insert(77, canvas);
         for (slot, x) in [(0, 10), (1, 200)] {
             runtime.stack.extend_from_slice(&[20, x, slot, 77]);
             assert!(matches!(
@@ -17745,7 +17899,7 @@ mod tests {
             .thumbnail_sprites
             .values()
             .all(|handle| sprites.get(*handle).is_some_and(|sprite| {
-                sprite.effective_priority() == SAVE_DRAWING_PRIORITY
+                sprite.effective_priority() == canvas_priority
                     && sprite.color.alpha() == 255
                     && sprite.draw_command(&sprites).is_some()
             })));
@@ -17755,7 +17909,7 @@ mod tests {
         let text_handle = *runtime.save_state.text_sprites.values().next().unwrap();
         let text_sprite = sprites.get(text_handle).unwrap();
         assert!(text_sprite.source_name.contains("保存1"));
-        assert_eq!(text_sprite.effective_priority(), SAVE_DRAWING_PRIORITY);
+        assert_eq!(text_sprite.effective_priority(), canvas_priority);
         assert!(text_sprite.draw_command(&sprites).is_some());
         assert!(sprites
             .surface(text_sprite.surface)
