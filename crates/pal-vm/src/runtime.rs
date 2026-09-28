@@ -12,14 +12,14 @@ use pal_script::{Operand, OperandKind, PointTable, ScriptImage};
 
 use crate::assets::CoreAssets;
 use crate::audio::{
-    audio_lookup_key, decode_game_audio, parse_bgm_csv, AudioConfig, AudioHandle, AudioSystem,
-    BgmLoop, PalSoundGroup, PalVolume,
+    audio_lookup_key, decode_game_audio, parse_bgm_csv, AudioHandle, AudioSystem, BgmLoop,
+    PalSoundGroup, PalVolume,
 };
 use crate::config::{ini_graphics_size, parse_ini_nls, IniFile, IniValue};
 use crate::effect::PalEffectSystem;
 use crate::font::PalFontSystem;
 use crate::image::{decode_image, decode_image_with_resolver, DecodedImage};
-use crate::input::{PalInputState, PalMouseButton};
+use crate::input::{PalInputState, PalKey, PalMouseButton};
 use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
 use crate::save_format::{
     composite_thumbnail, decode_original_save, encode_original_save, mosaic_rgba,
@@ -250,6 +250,10 @@ pub enum WaitRequest {
     Click,
     /// Wait until either a click/input push arrives or N PAL milliseconds elapse.
     ClickOrTime(u32),
+    /// ADV auto-mode hold: like `ClickOrTime`, but the timeout only finishes
+    /// the wait after voice playback has also ended (native auto advance
+    /// requires the voice channels idle, koikake.exe 0x42F9D0).
+    AutoClickOrTime(u32),
     /// Wait for the active ADV text reveal task to finish before allowing the
     /// script to advance. Kept for older traces; current Game.exe evidence shows
     /// text_w/text_wa only update reveal state and the following wait syscall owns
@@ -451,14 +455,25 @@ pub struct ScriptRuntime {
     pending_voice_wait_slot: Option<i32>,
     font_state: PalFontSystem,
     text_state: TextSubsystemState,
-    /// Text skip latch at VM offset +804248.  Game.exe category 9
-    /// skip_set/skip_is (`sub_438C40`/`sub_438C00`) updates this byte and the
-    /// ADV text task consults it while deciding whether to bypass waits.
+    /// Text skip latch (koikake.exe ADVctx+0x31828, written by skip_set
+    /// 0x428E10, read through GetSkipState 0x437800 bit 0).  The ADV text
+    /// task consults it every frame while deciding whether to bypass waits.
     text_skip_enabled: bool,
-    /// Text auto latch at VM offset +804252.  Game.exe category 9
-    /// auto_set/auto_is (`sub_438A90`/`sub_438A50`) controls whether the
-    /// post-reveal ADV text state may finish by timer instead of by input.
+    /// Text auto latch (koikake.exe ADVctx+0x3182C, auto_set 0x428CD0).
+    /// When set, the post-reveal ADV text state finishes by timer instead of
+    /// by input, gated on voice playback having finished.
     text_auto_enabled: bool,
+    /// Scene-skip latch (koikake.exe ADVctx+0x31830), set by the category 9
+    /// index 51 `scene_skip` extcall (0x427BA0) and cleared by
+    /// `cancel_scene_skip` (0x427B40), select entry, or arrival at unread
+    /// text.  While set, native GetSkipState returns -1 so every wait and
+    /// reveal behaves as skipped.
+    scene_skip_active: bool,
+    /// Last frame's evaluated GetSkipState value, cached at the top of
+    /// run_frame so extcall handlers that receive no input state (run,
+    /// effect_stop, sp_transition) can mirror the native per-frame skip
+    /// checks.
+    last_skip_state: i32,
     select_state: SelectSubsystemState,
     save_state: SaveSubsystemState,
     history_state: HistorySubsystemState,
@@ -474,8 +489,10 @@ pub struct ScriptRuntime {
     random_state: PalRandomState,
     /// Per-frame events accumulated during run_frame(); cleared at the start of each frame.
     frame_events: Vec<FrameEvent>,
-    /// Button callback gosub to inject at the top of the next script frame (point ID, not PC).
-    pending_gosub_point: Option<u32>,
+    /// Button callback gosubs to inject at the top of the next script frame
+    /// (point IDs, not PCs).  A burst of clicks while a modal gosub is still
+    /// running must queue in order rather than overwrite a single slot.
+    pending_gosub_points: VecDeque<u32>,
     /// ADV click waits parked while a modal menu gosub runs on top of them.
     modal_wait_suspensions: Vec<ModalWaitSuspension>,
     /// Category 9:23 continuation target.  Unlike button callbacks, this is a
@@ -555,6 +572,23 @@ struct GameSystemButtonEntry {
     image: i32,
     state: i32,
     enabled: bool,
+}
+
+/// Outcome of per-frame button/shortcut input routing, telling the engine
+/// which input edges were consumed so wait tasks never see them twice.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ButtonInputOutcome {
+    /// A mouse push edge was consumed (button reaction or mouse-bound
+    /// system-button shortcut).
+    pub consumed_mouse_push: bool,
+    /// A key or wheel push edge was consumed by a system-button shortcut.
+    pub consumed_push_edge: bool,
+}
+
+impl ButtonInputOutcome {
+    pub fn consumed_any(self) -> bool {
+        self.consumed_mouse_push || self.consumed_push_edge
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -721,6 +755,12 @@ struct TextSubsystemState {
     reveal_start_ms: u32,
     reveal_duration_ms: u32,
     reveal_enabled: bool,
+    /// Wait geometry of the current line captured at submit time: the full
+    /// typewriter reveal span and the auto-mode post-reveal hold.  A modal
+    /// gosub that flips auto/skip mid-line rebuilds the parked wait from
+    /// these instead of re-resolving the text.
+    current_reveal_ms: u32,
+    current_auto_hold_ms: u32,
     sprite: Option<SpriteHandle>,
     name_sprite: Option<SpriteHandle>,
     base_image_value: i32,
@@ -815,6 +855,8 @@ impl Default for TextSubsystemState {
             reveal_start_ms: 0,
             reveal_duration_ms: 0,
             reveal_enabled: false,
+            current_reveal_ms: 0,
+            current_auto_hold_ms: 0,
             sprite: None,
             name_sprite: None,
             base_image_value: 0,
@@ -1134,7 +1176,7 @@ impl ThreadWaitState {
                 now_ms.wrapping_sub(self.started_ms) >= ms
             }
             WaitRequest::Click => input.is_some_and(PalInputState::any_push),
-            WaitRequest::ClickOrTime(ms) => {
+            WaitRequest::ClickOrTime(ms) | WaitRequest::AutoClickOrTime(ms) => {
                 input.is_some_and(PalInputState::any_push)
                     || now_ms.wrapping_sub(self.started_ms) >= ms
             }
@@ -1311,6 +1353,8 @@ impl ScriptRuntime {
             text_state: TextSubsystemState::default(),
             text_skip_enabled: false,
             text_auto_enabled: false,
+            scene_skip_active: false,
+            last_skip_state: 0,
             select_state: SelectSubsystemState::default(),
             save_state: SaveSubsystemState::default(),
             history_state: HistorySubsystemState::default(),
@@ -1322,7 +1366,7 @@ impl ScriptRuntime {
             system_state: PalSystemState::new(),
             random_state: PalRandomState::default(),
             frame_events: Vec::new(),
-            pending_gosub_point: None,
+            pending_gosub_points: VecDeque::new(),
             modal_wait_suspensions: Vec::new(),
             pending_jump_point: None,
             menu_transition_mode: 0,
@@ -1628,7 +1672,7 @@ impl ScriptRuntime {
     /// would advance the story, so the engine must route the click through
     /// `suspend_wait_for_modal` instead of `resolve_pending_wait`.
     pub fn should_suspend_wait_for_modal(&self) -> bool {
-        self.pending_gosub_point.is_some()
+        !self.pending_gosub_points.is_empty()
             && matches!(self.status, RuntimeStatus::WaitClick { .. })
     }
 
@@ -1675,9 +1719,20 @@ impl ScriptRuntime {
         self.text_state.visible = susp.text_visible;
         self.text_state.show_wait_mark = susp.show_wait_mark;
         self.text_state.dirty = true;
-        self.wait_task_kind = Some(susp.request);
-        self.status = match susp.request {
-            WaitRequest::Click | WaitRequest::ClickOrTime(_) => {
+        // The modal gosub may have flipped auto/skip mid-line (the ADV
+        // SKIP/AUTO buttons run as modal gosubs on top of this wait).
+        // Native wait code polls the latches live every frame: with auto
+        // newly enabled the parked click wait gains the post-reveal hold
+        // timer; with skip enabled the plain click wait is fine because the
+        // task layer completes it through the live skip check.
+        let request = if self.text_auto_enabled && matches!(susp.request, WaitRequest::Click) {
+            WaitRequest::AutoClickOrTime(self.text_state.current_auto_hold_ms.max(1))
+        } else {
+            susp.request
+        };
+        self.wait_task_kind = Some(request);
+        self.status = match request {
+            WaitRequest::Click | WaitRequest::ClickOrTime(_) | WaitRequest::AutoClickOrTime(_) => {
                 RuntimeStatus::WaitClick { pc: self.pc }
             }
             _ => RuntimeStatus::WaitFrame { pc: self.pc },
@@ -1685,9 +1740,9 @@ impl ScriptRuntime {
         log::debug!(
             "[trace-wait] modal repark pc=0x{:08X} request={:?}",
             self.pc,
-            susp.request
+            request
         );
-        Some(susp.request)
+        Some(request)
     }
 
     /// Inject the PAL cached frame time used by Game.exe wait-sync wrappers.
@@ -2368,6 +2423,74 @@ impl ScriptRuntime {
         self.text_state.reveal_duration_ms.saturating_sub(elapsed)
     }
 
+    /// Portable mirror of koikake.exe GetSkipState (0x437800), the single hub
+    /// every native wait/reveal/effect consumer polls each frame:
+    ///   scene-skip latch -> -1; skip byte -> bit 0; wheel-up or
+    ///   Space/Return/left-click push -> bit 3; held Ctrl -> bit 2.
+    pub fn skip_state(&self, input: &PalInputState) -> i32 {
+        if self.scene_skip_active {
+            return -1;
+        }
+        let mut state = 0i32;
+        if self.text_skip_enabled {
+            state |= 1;
+        }
+        if input.wheel_delta() > 0.0 {
+            state |= 8;
+        }
+        if input.any_push() {
+            state |= 8;
+        }
+        if input.fast_forward_held() {
+            state |= 4;
+        }
+        state
+    }
+
+    /// The held/latched part of `skip_state`: true while skip mode, scene
+    /// skip, or Ctrl fast-forward should keep completing waits every frame
+    /// (as opposed to push edges, which the wait tasks observe directly).
+    pub fn skip_active(&self, input: &PalInputState) -> bool {
+        self.scene_skip_active || self.text_skip_enabled || input.fast_forward_held()
+    }
+
+    /// Skip state for extcall handlers without input access: the frame-cached
+    /// input bits re-combined with the live script latches, matching how
+    /// native consumers poll GetSkipState at use time.
+    fn dispatch_skip_state(&self) -> i32 {
+        if self.scene_skip_active {
+            return -1;
+        }
+        let mut state = self.last_skip_state;
+        if self.text_skip_enabled {
+            state |= 1;
+        }
+        state
+    }
+
+    /// Finish the typewriter reveal immediately.  Native completes the reveal
+    /// in the same frame its text tick sees a non-zero skip state
+    /// (0x42CE40), without advancing the parked wait by itself.
+    pub fn complete_text_reveal_for_skip(&mut self) {
+        if self.text_reveal_remaining_ms() == 0 {
+            return;
+        }
+        self.text_state.reveal_enabled = false;
+        self.text_state.dirty = true;
+        log::debug!("[trace-text] reveal completed by skip state");
+    }
+
+    /// True while any registered voice channel (category 13) is still
+    /// playing.  Native auto-mode advance polls PalSoundPlayIs across the
+    /// voice channels before letting the hold timer finish the wait
+    /// (0x431180, consulted by 0x42F9D0).
+    pub fn any_voice_playing(&self, audio: &AudioSystem) -> bool {
+        self.game_audio
+            .iter()
+            .filter(|((category, _), _)| *category == 13)
+            .any(|(_, handle)| audio.is_playing(*handle).unwrap_or(false))
+    }
+
     pub fn sync_history_sprite(
         &mut self,
         assets: &CoreAssets,
@@ -2755,18 +2878,28 @@ impl ScriptRuntime {
     }
 
     fn text_wait_request_after_submit(
-        &self,
+        &mut self,
         text_value: i32,
         reveal_ms: u32,
         assets: &CoreAssets,
         nls: Nls,
     ) -> WaitRequest {
-        if self.text_skip_enabled {
-            return WaitRequest::TextReveal(reveal_ms.max(1));
+        let auto_ms = self.text_auto_hold_duration_ms(text_value, assets, nls);
+        self.text_state.current_reveal_ms = reveal_ms;
+        self.text_state.current_auto_hold_ms = auto_ms;
+        if self.text_skip_enabled || self.scene_skip_active {
+            // Native skip completes the reveal in the same frame its text
+            // tick sees the skip state and advances without a click; the
+            // engine completes the reveal and the task layer completes the
+            // wait through the live skip check.
+            return WaitRequest::TextReveal(1);
         }
         if self.text_auto_enabled {
-            let auto_ms = self.text_auto_hold_duration_ms(text_value, assets, nls);
-            return WaitRequest::ClickOrTime(reveal_ms.saturating_add(auto_ms).max(1));
+            // Native arms the auto hold when the post-reveal wait begins
+            // (text_len/font_unit * auto_speed% + 500ms); the engine adds
+            // the remaining reveal span when it creates the wait task, so
+            // only the hold belongs in the request.
+            return WaitRequest::AutoClickOrTime(auto_ms.max(1));
         }
         WaitRequest::Click
     }
@@ -2775,7 +2908,7 @@ impl ScriptRuntime {
         &mut self,
         sprites: &mut SpriteSystem,
         input: &PalInputState,
-    ) -> bool {
+    ) -> ButtonInputOutcome {
         let (mouse_x, mouse_y) = input.mouse_position();
         if input.mouse_push(PalMouseButton::Left)
             && !self.adv_menu_expanded
@@ -2793,7 +2926,10 @@ impl ScriptRuntime {
         {
             self.adv_menu_expanded = true;
             self.sync_adv_button_chrome_visibility(sprites);
-            return true;
+            return ButtonInputOutcome {
+                consumed_mouse_push: true,
+                ..Default::default()
+            };
         }
         if input.mouse_push(PalMouseButton::Left)
             && self.adv_menu_expanded
@@ -2810,13 +2946,16 @@ impl ScriptRuntime {
         {
             self.adv_menu_expanded = false;
             self.sync_adv_button_chrome_visibility(sprites);
-            return true;
+            return ButtonInputOutcome {
+                consumed_mouse_push: true,
+                ..Default::default()
+            };
         }
         let hovered = self.button_hit_at(sprites, mouse_x, mouse_y, -1);
         if !input.mouse_on(PalMouseButton::Left) {
             self.pressed_button = None;
         }
-        let mut consumed_mouse_push = false;
+        let mut outcome = ButtonInputOutcome::default();
         if input.mouse_push(PalMouseButton::Left) {
             if let Some((group, index)) = hovered {
                 self.button_push_queue
@@ -2825,10 +2964,68 @@ impl ScriptRuntime {
                     .push_back(index);
                 self.pressed_button = Some((group, index));
                 self.dispatch_button_push_compat(group, index);
-                consumed_mouse_push = true;
+                outcome.consumed_mouse_push = true;
                 log::debug!(
                     "[trace-button] push latch group={group} index={index} pos=({mouse_x},{mouse_y})"
                 );
+            }
+        }
+        // Game category 12 system buttons: Game.exe polls the slot table every
+        // frame (0x4291F0) and maps each slot to one physical input through the
+        // jump table at 0x4294E0 plus the Pal.dll VK table at 0x1011A218:
+        //   0 = right mouse, 1 = wheel down, 2 = wheel up, 3 = left mouse,
+        //   4..=15 = F1..F12, 16 = ESC, 17..=20 = arrow up/down/left/right.
+        // A bound, enabled slot injects its script gosub point — the same
+        // channel a cancel-button click uses — and PAL scripts cannot observe
+        // raw input directly.  koikake binds its cancel handlers under both
+        // slot 0 and 16 (settings COM_BTN_EXIT point 2127, backlog 戻る point
+        // 2900) and ADV quick actions under the wheel/arrow slots.  Native
+        // also suppresses the whole poll while any key is held and supports
+        // hold-repeat through KeyOnEx when `state` is non-zero; koikake keeps
+        // `state` at 0, so only push edges are dispatched here.
+        if input.mouse_push(PalMouseButton::Right) && self.queue_system_button_shortcut(0, input) {
+            outcome.consumed_mouse_push = true;
+        }
+        if input.mouse_push(PalMouseButton::Left) && self.queue_system_button_shortcut(3, input) {
+            outcome.consumed_mouse_push = true;
+        }
+        if input.wheel_delta() < 0.0 && self.queue_system_button_shortcut(1, input) {
+            outcome.consumed_push_edge = true;
+        }
+        if input.wheel_delta() > 0.0 && self.queue_system_button_shortcut(2, input) {
+            outcome.consumed_push_edge = true;
+        }
+        if input.key_push(PalKey::Escape) && self.queue_system_button_shortcut(16, input) {
+            outcome.consumed_push_edge = true;
+        }
+        let arrow_slots = [
+            (17, PalKey::Up),
+            (18, PalKey::Down),
+            (19, PalKey::Left),
+            (20, PalKey::Right),
+        ];
+        for (slot, key) in arrow_slots {
+            if input.key_push(key) && self.queue_system_button_shortcut(slot, input) {
+                outcome.consumed_push_edge = true;
+            }
+        }
+        let f_keys = [
+            PalKey::F1,
+            PalKey::F2,
+            PalKey::F3,
+            PalKey::F4,
+            PalKey::F5,
+            PalKey::F6,
+            PalKey::F7,
+            PalKey::F8,
+            PalKey::F9,
+            PalKey::F10,
+            PalKey::F11,
+            PalKey::F12,
+        ];
+        for (offset, key) in f_keys.into_iter().enumerate() {
+            if input.key_push(key) && self.queue_system_button_shortcut(4 + offset as i32, input) {
+                outcome.consumed_push_edge = true;
             }
         }
 
@@ -2862,7 +3059,27 @@ impl ScriptRuntime {
             };
             sprites.rect_set_pos(entry.handle, 0, row);
         }
-        consumed_mouse_push
+        outcome
+    }
+
+    /// Queue the gosub point bound to one system-button slot.  Returns true
+    /// when the slot has an enabled binding with a valid point id.  Native
+    /// requires both the active and enable flags (system_btn_set initializes
+    /// enable to 1; system_btn_enable rewrites it).
+    fn queue_system_button_shortcut(&mut self, slot: i32, input: &PalInputState) -> bool {
+        let Some(entry) = self.system_buttons.get(&slot) else {
+            return false;
+        };
+        if !entry.enabled || entry.image <= 0 {
+            return false;
+        }
+        let point_id = entry.image as u32;
+        self.pending_gosub_points.push_back(point_id);
+        let (mouse_x, mouse_y) = input.mouse_position();
+        log::debug!(
+            "[trace-system-button] shortcut slot={slot} -> queued gosub point[{point_id}] pos=({mouse_x},{mouse_y})"
+        );
+        true
     }
 
     pub fn run_frame(
@@ -2887,6 +3104,11 @@ impl ScriptRuntime {
         // because a snapshot parked at an ADV click wait would otherwise never
         // reach the script loop that can see the audio backend.
         self.replay_restored_bgm(resource_manager.as_deref_mut(), audio.as_deref_mut());
+        // Cache this frame's GetSkipState value so extcall handlers that run
+        // without input access mirror the native per-frame skip polling.
+        if let Some(input) = input {
+            self.last_skip_state = self.skip_state(input);
+        }
         match self.status {
             RuntimeStatus::Halted { .. }
             | RuntimeStatus::UnsupportedCommand { .. }
@@ -2939,7 +3161,7 @@ impl ScriptRuntime {
         // Inject a pending button callback gosub before the script resumes.
         // The callback was stored by dispatch_button_push_compat when the user
         // clicked a button while the script was suspended in a wait_sync_step loop.
-        if let Some(point_id) = self.pending_gosub_point.take() {
+        if let Some(point_id) = self.pending_gosub_points.pop_front() {
             match assets.point_table.resolve_target_pc(point_id) {
                 Ok(Some(target_pc)) => {
                     self.call_stack.push(self.pc);
@@ -3387,7 +3609,9 @@ impl ScriptRuntime {
                         ));
                         let _ = self.write_extcall_dst(dst_slot_raw, value);
                         self.status = match request {
-                            WaitRequest::Click | WaitRequest::ClickOrTime(_) => {
+                            WaitRequest::Click
+                            | WaitRequest::ClickOrTime(_)
+                            | WaitRequest::AutoClickOrTime(_) => {
                                 RuntimeStatus::WaitClick { pc: self.pc }
                             }
                             WaitRequest::Frame(_)
@@ -4971,16 +5195,35 @@ impl ScriptRuntime {
                 self.pop_ext_args(0);
                 ExtCallOutcome::Value(self.system_state.hide_cursor_time())
             }
-            51 | 57 | 60 => {
+            51 => {
+                // Game category 9 index 51 (`scene_skip`, koikake.exe
+                // 0x427BA0) sets the scene-skip latch at ADVctx+0x31830 and
+                // stores its argument at +0x31834; while latched, native
+                // GetSkipState returns -1 so every wait, reveal, and effect
+                // behaves as skipped until cancel_scene_skip, a select entry,
+                // or arrival at unread text clears it.
+                let args = self.pop_ext_args(1);
+                self.scene_skip_active = true;
+                log::debug!(
+                    "[trace-system] scene_skip arg={}",
+                    args.first().copied().unwrap_or(0)
+                );
+                ExtCallOutcome::Value(1)
+            }
+            57 | 60 => {
                 self.pop_ext_args(1);
                 ExtCallOutcome::Value(1)
             }
             52 => {
-                // Game category 9 index 52 (`sub_437150`) cancels scene skip
-                // and updates save-point state only when the native scene-skip
-                // latch is set. It consumes no VM stack arguments.
+                // Game category 9 index 52 (`cancel_scene_skip`, koikake.exe
+                // 0x427B40) clears the scene-skip latch and updates save-point
+                // state only when the latch is set. It consumes no VM stack
+                // arguments.
                 self.pop_ext_args(0);
-                log::debug!("[trace-system] cancel_scene_skip");
+                if self.scene_skip_active {
+                    log::debug!("[trace-system] cancel_scene_skip");
+                }
+                self.scene_skip_active = false;
                 ExtCallOutcome::Value(1)
             }
             55 => {
@@ -5607,7 +5850,13 @@ impl ScriptRuntime {
                 // closest script-visible equivalent.
                 let args = self.pop_ext_args(2);
                 let flags = args.first().copied().unwrap_or(0x1D);
-                let duration_ms = args.get(1).copied().unwrap_or(0).max(0);
+                // koikake.exe 0x411E0F ("effect_stop skip"): while a skip
+                // state is active the fade-out duration is forced to zero.
+                let duration_ms = if self.dispatch_skip_state() != 0 {
+                    0
+                } else {
+                    args.get(1).copied().unwrap_or(0).max(0)
+                };
                 self.effect_system.stop_selected(flags);
                 log::debug!("[trace-effect] effect_stop flags={flags} duration_ms={duration_ms}");
                 ExtCallOutcome::Value(1)
@@ -5878,21 +6127,43 @@ impl ScriptRuntime {
                 let args = self.pop_ext_args(1);
                 let slot = args.first().copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
-                let has_portable_snapshot = self.save_state.snapshots.contains_key(&slot);
-                let has_loose_file = resource_manager
-                    .as_ref()
-                    .and_then(|manager| {
-                        portable_save_path(manager.root(), slot)
-                            .is_file()
-                            .then_some(portable_save_path(manager.root(), slot))
-                            .or_else(|| {
-                                find_loose_save_file(manager.root(), &original_save_filename(slot))
-                            })
-                    })
-                    .is_some();
-                self.save_state.last_result = i32::from(has_portable_snapshot || has_loose_file);
+                let has_save = if slot < 0 {
+                    // Native is_save(-1) (koikake.exe 0x4230c0) scans slots
+                    // 0..=999 and reports whether any save%03d.dat exists; it
+                    // never looks at continue.dat.
+                    let has_snapshot = self.save_state.snapshots.keys().any(|key| (0..=999).contains(key));
+                    has_snapshot
+                        || resource_manager
+                            .as_ref()
+                            .is_some_and(|manager| (0..=999).any(|candidate| {
+                                portable_save_path(manager.root(), candidate).is_file()
+                                    || find_loose_save_file(
+                                        manager.root(),
+                                        &original_save_filename(candidate),
+                                    )
+                                    .is_some()
+                            }))
+                } else {
+                    let has_portable_snapshot = self.save_state.snapshots.contains_key(&slot);
+                    let has_loose_file = resource_manager
+                        .as_ref()
+                        .and_then(|manager| {
+                            portable_save_path(manager.root(), slot)
+                                .is_file()
+                                .then_some(portable_save_path(manager.root(), slot))
+                                .or_else(|| {
+                                    find_loose_save_file(
+                                        manager.root(),
+                                        &original_save_filename(slot),
+                                    )
+                                })
+                        })
+                        .is_some();
+                    has_portable_snapshot || has_loose_file
+                };
+                self.save_state.last_result = i32::from(has_save);
                 log::debug!(
-                    "[trace-save] is_save slot={slot} snapshot={has_portable_snapshot} loose_file={has_loose_file} -> {}",
+                    "[trace-save] is_save slot={slot} -> {}",
                     self.save_state.last_result
                 );
                 ExtCallOutcome::Value(self.save_state.last_result)
@@ -6601,12 +6872,16 @@ impl ScriptRuntime {
     }
 
     fn dispatch_system_button_stub(&mut self, index: u16) -> ExtCallOutcome {
-        // Game category 12 system buttons are Game.exe-managed window/menu
-        // controls, not PAL.dll exports.  sub_439270 pops
-        // system_btn_set(index,image,state); sub_439100 pops
-        // system_btn_enable(index,enabled) and supports index 0xFFFF as an
-        // all-slot wildcard.  The portable runtime records stack/return
-        // semantics here while platform window drawing stays outside PAL.
+        // Game category 12 system buttons bind input shortcuts to script
+        // gosub points.  `image` is not a sprite resource but the point id to
+        // invoke: koikake registers the current screen's cancel handler under
+        // slot 0 (right mouse button) and slot 16 (ESC), e.g. point 2127
+        // (COM_BTN_EXIT) on the settings screen and point 2900 (戻る) on the
+        // backlog; ADV additionally binds wheel/arrow/F-key slots to its own
+        // quick-action points.  `state` only enables native hold-repeat
+        // (KeyOnEx) and stays 0 in koikake; `system_btn_enable` gates
+        // shortcut dispatch through the per-slot enable flag.  Slot 0xFFFF is
+        // the all-slot wildcard.
         match index {
             0 => {
                 let args = self.pop_ext_args(3);
@@ -6621,7 +6896,9 @@ impl ScriptRuntime {
                     GameSystemButtonEntry {
                         image,
                         state,
-                        enabled: state != 0,
+                        // system_btn_set initializes the enable flag to 1;
+                        // system_btn_enable rewrites it afterwards.
+                        enabled: true,
                     },
                 );
                 log::debug!("[trace-system-button] set slot={slot} image={image} state={state}");
@@ -6924,6 +7201,14 @@ impl ScriptRuntime {
                     log::debug!(
                         "[trace-run] run queued stack effect={effect_id} arg1={arg1} arg2={arg2}"
                     );
+                    return ExtCallOutcome::Value(1);
+                }
+                if effect_id != 0 && self.dispatch_skip_state() != 0 {
+                    // koikake.exe 0x417DD9 ("run  skip"): while any skip state
+                    // is active the PalEffectEx call is skipped entirely and
+                    // the script does not wait for the transition.
+                    self.run_pipeline.effect_active = false;
+                    log::debug!("[trace-run] run skip effect={effect_id}");
                     return ExtCallOutcome::Value(1);
                 }
                 self.run_pipeline.effect_active = effect_id != 0;
@@ -12893,7 +13178,14 @@ impl ScriptRuntime {
         }
         self.game_buttons.clear();
         self.button_push_queue.clear();
-        self.system_buttons.clear();
+        // A load also drops any transient scene-skip mode; the script re-arms
+        // skip or auto through its own handlers if the resumed scene wants
+        // them.
+        self.scene_skip_active = false;
+        // system_buttons survive load: the script registers the target
+        // scene's shortcut bindings before issuing load (koikake's CONTINUE /
+        // DATA LOAD handlers bind the ADV slots 0..18 up front), and the
+        // parked resume does not re-register them.
         for retired in self.retired_sprites.drain(..) {
             sprites.release(retired.handle);
         }
@@ -14815,7 +15107,7 @@ impl ScriptRuntime {
         else {
             return;
         };
-        self.pending_gosub_point = Some(point_id);
+        self.pending_gosub_points.push_back(point_id);
         log::debug!(
             "[trace-button] queued gosub for group={group} index={index} -> point[{point_id}]"
         );
@@ -17183,6 +17475,7 @@ enum StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::AudioConfig;
 
     #[test]
     fn script_priority_cursor_layers_popup_over_existing_buttons() {
@@ -17757,7 +18050,7 @@ mod tests {
         let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
         runtime.status = RuntimeStatus::WaitClick { pc: 0x2000 };
         runtime.wait_task_kind = Some(WaitRequest::Click);
-        runtime.pending_gosub_point = Some(7);
+        runtime.pending_gosub_points.push_back(7);
         runtime.text_state.visible = true;
         runtime.text_state.show_wait_mark = true;
         assert!(runtime.should_suspend_wait_for_modal());
@@ -17786,7 +18079,7 @@ mod tests {
         // A modal that exits through a different path must not re-park.
         runtime.status = RuntimeStatus::WaitClick { pc: 0x3000 };
         runtime.wait_task_kind = Some(WaitRequest::Click);
-        runtime.pending_gosub_point = Some(8);
+        runtime.pending_gosub_points.push_back(8);
         runtime.suspend_wait_for_modal();
         runtime.pc = 0x4560;
         assert_eq!(runtime.take_modal_wait_repark(), None);

@@ -4,7 +4,8 @@ use clap::Parser;
 use pal_asset::Nls;
 use pal_vm::{
     run_sena, AudioConfig, DiagnosticAutoAdvance, DiagnosticClick, DiagnosticClickWhenHitEnabled,
-    DiagnosticKeyEvent, DiagnosticPngAt, FrameScene, MouseButton, ScriptRuntimeConfig, SenaConfig,
+    DiagnosticKeyEvent, DiagnosticPngAt, DiagnosticWheelEvent, FrameScene, MouseButton,
+    ScriptRuntimeConfig, SenaConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -130,6 +131,10 @@ struct Args {
     #[arg(long, value_parser = parse_diagnostic_key_hold)]
     diagnostic_key_hold: Vec<(DiagnosticKeyEvent, DiagnosticKeyEvent)>,
 
+    /// Inject a mouse wheel step as frame:delta_y. Can be passed more than once.
+    #[arg(long, value_parser = parse_diagnostic_wheel)]
+    diagnostic_wheel: Vec<DiagnosticWheelEvent>,
+
     /// Inject repeated diagnostic clicks to advance wait-click/text paths.
     #[arg(long)]
     diagnostic_auto_advance: bool,
@@ -191,6 +196,7 @@ fn main() -> anyhow::Result<()> {
             .collect(),
         diagnostic_click_when_hit_enabled: args.diagnostic_click_when_hit_enabled,
         diagnostic_key_events,
+        diagnostic_wheel_events: args.diagnostic_wheel,
         diagnostic_auto_advance,
         ..SenaConfig::default()
     })
@@ -357,8 +363,25 @@ fn parse_diagnostic_png_at(raw: &str) -> Result<DiagnosticPngAt, String> {
     })
 }
 
-fn normalize_diagnostic_key(raw: &str) -> String {
-    match raw {
+fn parse_diagnostic_wheel(raw: &str) -> Result<DiagnosticWheelEvent, String> {
+    let mut parts = raw.split(':');
+    let frame = parts
+        .next()
+        .ok_or_else(|| "missing frame".to_owned())?
+        .parse::<usize>()
+        .map_err(|err| format!("invalid frame: {err}"))?;
+    let delta_y = parts
+        .next()
+        .ok_or_else(|| "missing delta_y".to_owned())?
+        .parse::<f32>()
+        .map_err(|err| format!("invalid delta_y: {err}"))?;
+    if parts.next().is_some() {
+        return Err("expected frame:delta_y".to_owned());
+    }
+    Ok(DiagnosticWheelEvent { frame, delta_y })
+}
+
+fn normalize_diagnostic_key(raw: &str) -> String {    match raw {
         "Ctrl" | "ctrl" | "CTRL" | "Control" | "control" => "Control".to_owned(),
         "LControl" | "LeftControl" | "ControlLeft" | "LeftCtrl" => "ControlLeft".to_owned(),
         "RControl" | "RightControl" | "ControlRight" | "RightCtrl" => "ControlRight".to_owned(),
