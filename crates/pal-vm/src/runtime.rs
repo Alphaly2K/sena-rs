@@ -474,6 +474,16 @@ pub struct ScriptRuntime {
     /// effect_stop, sp_transition) can mirror the native per-frame skip
     /// checks.
     last_skip_state: i32,
+    /// Read-text bitmap (koikake.exe ctx+0xC6760): one entry per Text.dat
+    /// pool record id.  Native sets the bit as soon as a line is displayed
+    /// (0x437920) and consults it (0x437990) in the skip gates and the
+    /// scene-skip display skip.  Persisted across sessions like the native
+    /// system.dat bitmap.
+    read_text_ids: BTreeSet<u32>,
+    /// Whether the currently displayed line was already read (native
+    /// text+0x858), refreshed by every text submit.  skip_set refuses to
+    /// latch while an unread line is on screen in read-only mode.
+    current_line_read: bool,
     select_state: SelectSubsystemState,
     save_state: SaveSubsystemState,
     history_state: HistorySubsystemState,
@@ -572,6 +582,11 @@ struct GameSystemButtonEntry {
     image: i32,
     state: i32,
     enabled: bool,
+    /// Last dispatch time (pal ms) for state!=0 hold-repeat (native KeyOnEx).
+    last_fired_ms: u32,
+    /// Whether the first hold-repeat interval (native's longer initial delay)
+    /// has already elapsed for the current hold.
+    repeated: bool,
 }
 
 /// Outcome of per-frame button/shortcut input routing, telling the engine
@@ -1115,7 +1130,10 @@ struct HistorySubsystemState {
     colors: [i32; 2],
     layout: [i32; 7],
     current_text_value: i32,
+    /// Native ctx+0x5D64: total pixel height of the laid-out backlog text.
     height: i32,
+    /// Native ctx+0x5D70: scroll position in RECORD units; 0 shows the newest
+    /// records at the bottom of the view and `max` shows the oldest.
     scroll_y: i32,
     active: bool,
     records: Vec<[i32; 9]>,
@@ -1175,9 +1193,9 @@ impl ThreadWaitState {
             WaitRequest::Time(ms) | WaitRequest::TextReveal(ms) => {
                 now_ms.wrapping_sub(self.started_ms) >= ms
             }
-            WaitRequest::Click => input.is_some_and(PalInputState::any_push),
+            WaitRequest::Click => input.is_some_and(PalInputState::click_push),
             WaitRequest::ClickOrTime(ms) | WaitRequest::AutoClickOrTime(ms) => {
-                input.is_some_and(PalInputState::any_push)
+                input.is_some_and(PalInputState::click_push)
                     || now_ms.wrapping_sub(self.started_ms) >= ms
             }
         }
@@ -1355,6 +1373,8 @@ impl ScriptRuntime {
             text_auto_enabled: false,
             scene_skip_active: false,
             last_skip_state: 0,
+            read_text_ids: BTreeSet::new(),
+            current_line_read: false,
             select_state: SelectSubsystemState::default(),
             save_state: SaveSubsystemState::default(),
             history_state: HistorySubsystemState::default(),
@@ -1438,6 +1458,15 @@ impl ScriptRuntime {
                 "voice_muted" => self.text_state.voice_muted = value != 0,
                 "text_skip_enabled" => self.text_skip_enabled = value != 0,
                 "text_auto_enabled" => self.text_auto_enabled = value != 0,
+                "text_speed_percent" => {
+                    self.system_state.set_text_speed_percent(value);
+                }
+                "auto_speed_percent" => {
+                    self.system_state.set_auto_speed_percent(value);
+                }
+                "skip_gate" => {
+                    self.system_state.set_skip_gate(value);
+                }
                 key => {
                     if let Some(slot) = key.strip_prefix("se_volume_percent_") {
                         if let Ok(slot) = slot.parse::<i32>() {
@@ -1460,6 +1489,7 @@ impl ScriptRuntime {
             path.display()
         );
         self.load_portable_system_mem(root);
+        self.load_portable_read_lines(root);
     }
 
     /// Load the persisted system_mem bank (global script settings, e.g. the
@@ -1501,13 +1531,51 @@ impl ScriptRuntime {
         Ok(path)
     }
 
+    fn write_portable_read_lines(&self, root: &Path) -> std::io::Result<PathBuf> {
+        let path = portable_read_lines_path(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_portable_read_lines(&self.read_text_ids);
+        std::fs::write(&path, bytes)?;
+        log::debug!(
+            "[trace-save] wrote portable read lines {} ({} ids)",
+            path.display(),
+            self.read_text_ids.len()
+        );
+        Ok(path)
+    }
+
+    /// Load the persisted read-text bitmap (native persists it in
+    /// system.dat; sena-rs stores a portable companion file).
+    fn load_portable_read_lines(&mut self, root: &Path) {
+        let path = portable_read_lines_path(root);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        match decode_portable_read_lines(&bytes) {
+            Ok(ids) => {
+                log::debug!(
+                    "[trace-save] loaded portable read lines {} ({} ids)",
+                    path.display(),
+                    ids.len()
+                );
+                self.read_text_ids = ids;
+            }
+            Err(err) => log::warn!(
+                "[trace-save] ignoring invalid portable read lines {}: {err}",
+                path.display()
+            ),
+        }
+    }
+
     fn write_portable_system_data(&self, root: &Path) -> std::io::Result<PathBuf> {
         let path = portable_system_data_path(root);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut text = format!(
-            "master_volume_percent={}\nmaster_muted={}\nbgm_volume_percent={}\nbgm_muted={}\nvoice_volume_percent={}\nvoice_muted={}\ntext_skip_enabled={}\ntext_auto_enabled={}\n",
+            "master_volume_percent={}\nmaster_muted={}\nbgm_volume_percent={}\nbgm_muted={}\nvoice_volume_percent={}\nvoice_muted={}\ntext_skip_enabled={}\ntext_auto_enabled={}\ntext_speed_percent={}\nauto_speed_percent={}\nskip_gate={}\n",
             self.master_volume_percent,
             i32::from(self.master_muted),
             self.bgm_volume_percent,
@@ -1516,6 +1584,9 @@ impl ScriptRuntime {
             i32::from(self.text_state.voice_muted),
             i32::from(self.text_skip_enabled),
             i32::from(self.text_auto_enabled),
+            self.system_state.text_speed_percent(),
+            self.system_state.auto_speed_percent(),
+            self.system_state.skip_gate(),
         );
         for (slot, percent) in &self.se_volume_percent {
             text.push_str(&format!("se_volume_percent_{slot}={percent}\n"));
@@ -1700,9 +1771,32 @@ impl ScriptRuntime {
     /// Called after each executed instruction. When the innermost modal gosub
     /// has returned to the PC that followed the suspended wait, re-park the
     /// wait and hand its request back so the engine recreates the wait task.
+    /// True when the innermost modal gosub has unwound to the PC that followed
+    /// the suspended ADV click wait, i.e. `take_modal_wait_repark` would fire.
+    fn modal_repark_due(&self) -> bool {
+        let Some(susp) = self.modal_wait_suspensions.last() else {
+            return false;
+        };
+        self.call_stack.len() == susp.call_depth && self.pc == susp.return_pc
+    }
+
     fn take_modal_wait_repark(&mut self) -> Option<WaitRequest> {
         let susp = self.modal_wait_suspensions.last()?;
         if self.call_stack.len() > susp.call_depth {
+            return None;
+        }
+        // A modal handler may have queued a follow-up gosub instead of opening
+        // its menu directly: koikake's F-key shortcut points are pure
+        // re-dispatchers that call btn_set_hit (PalButtonSetReaction) onto the
+        // on-screen ADV buttons, and the clicked button's own menu gosub is
+        // what actually opens the screen.  Re-parking here would strand that
+        // queued gosub forever, so keep the wait suspended until the queue
+        // drains; the step loop injects the next gosub on top of the
+        // suspension before any story instruction can run.
+        if self.pc == susp.return_pc
+            && self.call_stack.len() == susp.call_depth
+            && !self.pending_gosub_points.is_empty()
+        {
             return None;
         }
         let susp = self.modal_wait_suspensions.pop()?;
@@ -2398,16 +2492,16 @@ impl ScriptRuntime {
     }
 
     pub fn consume_text_reveal_push(&mut self, input: &PalInputState) -> bool {
-        if !(input.any_push() || input.fast_forward_held()) || self.text_reveal_remaining_ms() == 0
+        if !(input.click_push() || input.fast_forward_held()) || self.text_reveal_remaining_ms() == 0
         {
             return false;
         }
-        let advance_wait = input.any_push();
+        let advance_wait = input.click_push();
         self.text_state.reveal_enabled = false;
         self.text_state.dirty = true;
         log::debug!(
-            "[trace-text] reveal completed by input/fast-forward any_push={} fast_forward={} advance_wait={advance_wait}",
-            input.any_push(),
+            "[trace-text] reveal completed by input/fast-forward click_push={} fast_forward={} advance_wait={advance_wait}",
+            input.click_push(),
             input.fast_forward_held()
         );
         advance_wait
@@ -2438,7 +2532,10 @@ impl ScriptRuntime {
         if input.wheel_delta() > 0.0 {
             state |= 8;
         }
-        if input.any_push() {
+        if input.key_push(PalKey::Space)
+            || input.key_push(PalKey::Return)
+            || input.mouse_push(PalMouseButton::Left)
+        {
             state |= 8;
         }
         if input.fast_forward_held() {
@@ -2451,18 +2548,78 @@ impl ScriptRuntime {
     /// skip, or Ctrl fast-forward should keep completing waits every frame
     /// (as opposed to push edges, which the wait tasks observe directly).
     pub fn skip_active(&self, input: &PalInputState) -> bool {
-        self.scene_skip_active || self.text_skip_enabled || input.fast_forward_held()
+        self.skip_engaged() || input.fast_forward_held()
+    }
+
+    /// Latched skip (skip byte or scene skip) after the read-only gate.
+    ///
+    /// koikake.exe consults the read bitmap in two places: 0x42C510 lets
+    /// scene-skip bypass a line's display only when the line is already
+    /// read, and 0x42CBD0 clears the text object's skip flag (text+0x85c)
+    /// when an unread line appears while skip is latched.  With the gate
+    /// open (task data +0xC != 0) every line skips; with it closed only
+    /// read lines skip.  Ctrl fast-forward bypasses the gate and is
+    /// composed by the caller.
+    fn skip_engaged(&self) -> bool {
+        if !(self.text_skip_enabled || self.scene_skip_active) {
+            return false;
+        }
+        self.system_state.skip_gate() != 0 || self.current_line_read
+    }
+
+    /// koikake.exe 0x42CBD0: every displayed text-pool line updates the
+    /// read bitmap and the current-line read flag, and posts the slot-1
+    /// cancel message when an unread line appears under latched skip in
+    /// read-only mode.
+    fn note_displayed_line(&mut self, text_value: i32, assets: &CoreAssets) {
+        let Some(id) = text_pool_record_id(text_value, assets) else {
+            // Runtime-generated strings have no pool record; native only
+            // gates pool lines, so treat them as read.
+            self.current_line_read = true;
+            return;
+        };
+        if self.read_text_ids.contains(&id) {
+            self.current_line_read = true;
+            return;
+        }
+        self.current_line_read = false;
+        self.read_text_ids.insert(id);
+        if self.system_state.skip_gate() == 0 && self.text_skip_enabled {
+            log::debug!("[trace-text] skip gate: unread line {id}, posting slot1 cancel");
+            self.post_engine_message(1, 0);
+        }
+    }
+
+    /// Engine-side post to the category-23 message board (koikake.exe
+    /// 0x421590): sets the slot flag and value; scripts poll the slot with
+    /// get_message and read the value with get_message_param.
+    fn post_engine_message(&mut self, slot: usize, value: i32) {
+        let slot = slot.min(7);
+        self.message_state.next_id = self.message_state.next_id.saturating_add(1).max(1);
+        let message = GameMessage {
+            active: true,
+            id: self.message_state.next_id,
+            value,
+            param: value,
+        };
+        self.message_state.slots[slot] = message;
+        self.message_state.queue.push(message);
     }
 
     /// Skip state for extcall handlers without input access: the frame-cached
     /// input bits re-combined with the live script latches, matching how
-    /// native consumers poll GetSkipState at use time.
+    /// native consumers poll GetSkipState at use time.  The latched lanes are
+    /// read-gated like skip_engaged so transitions do not skip through
+    /// unread text in read-only mode.
     fn dispatch_skip_state(&self) -> i32 {
-        if self.scene_skip_active {
+        if self.scene_skip_active && (self.system_state.skip_gate() != 0 || self.current_line_read)
+        {
             return -1;
         }
         let mut state = self.last_skip_state;
-        if self.text_skip_enabled {
+        if self.text_skip_enabled
+            && (self.system_state.skip_gate() != 0 || self.current_line_read)
+        {
             state |= 1;
         }
         state
@@ -2515,8 +2672,20 @@ impl ScriptRuntime {
         self.font_state.set_font_size(24);
         self.font_state.set_color(0xFF20_2020, 0x0000_0000);
 
-        let mut y = 0_i32.saturating_sub(self.history_state.scroll_y);
-        for record in self.history_state.records.iter().rev().take(24).rev() {
+        // Native scroll positions are record indices: 0 anchors the newest
+        // record at the bottom of the view, and each step toward `max` moves
+        // one record further into the past.  Slice the visible window out of
+        // the chronological record list instead of pixel-shifting the tail.
+        let count = self.history_state.records.len();
+        let pitch = self.history_line_pitch();
+        let visible = ((height as i32 / pitch).max(1)) as usize;
+        let pos = (self.history_state.scroll_y.max(0) as usize)
+            .min(count.saturating_sub(visible));
+        let end = count.saturating_sub(pos);
+        let start = end.saturating_sub(visible.max(1));
+        let mut y = 0i32;
+        for record in &self.history_state.records[start..end] {
+            let record = *record;
             let body = self
                 .resolved_dialog_text_arg(record[1], assets, nls)
                 .unwrap_or_default();
@@ -2532,7 +2701,7 @@ impl ScriptRuntime {
                 format!("{name}  {body}")
             };
             let (line_width, line_height, line_rgba) = self.font_state.rasterize(&line);
-            if y + line_height as i32 > 0 {
+            if y < height as i32 {
                 blit_rgba(
                     &mut rgba,
                     width,
@@ -2783,6 +2952,44 @@ impl ScriptRuntime {
         500_u32.saturating_add(chars.saturating_mul(350)).min(3500)
     }
 
+    /// Pixel pitch of one backlog line: rasterized 24px line plus the layout
+    /// gap the native log layout adds between records.
+    fn history_line_pitch(&mut self) -> i32 {
+        let saved_size = self.font_state.font_size();
+        self.font_state.set_font_size(24);
+        let (_, probe_height, _) = self.font_state.rasterize("あ");
+        self.font_state.set_font_size(saved_size);
+        (probe_height as i32 + 10).max(1)
+    }
+
+    /// Recompute the pixel height native history_begin/history_get_height
+    /// report (records * pitch minus one trailing gap).
+    fn refresh_history_layout_metrics(&mut self) {
+        let count = self.history_state.records.len() as i32;
+        if count == 0 {
+            self.history_state.height = 0;
+            return;
+        }
+        let pitch = self.history_line_pitch();
+        self.history_state.height = count.saturating_mul(pitch).saturating_sub(10);
+    }
+
+    /// How many record lines fit into the history view rect.
+    fn history_visible_capacity(&mut self) -> usize {
+        let pitch = self.history_line_pitch();
+        let view = (self.history_state.rect[3] - self.history_state.rect[1]).max(1);
+        (view / pitch).max(1) as usize
+    }
+
+    /// Native ctx+0x5D6C: maximum scroll position in record units.
+    fn history_max_scroll_pos(&mut self) -> i32 {
+        let visible = self.history_visible_capacity();
+        self.history_state
+            .records
+            .len()
+            .saturating_sub(visible) as i32
+    }
+
     fn push_history_text_record(&mut self, text_args: [i32; 4]) {
         if !self.text_state.history_enabled {
             return;
@@ -2813,12 +3020,7 @@ impl ScriptRuntime {
             self.text_state.mode,
             self.pal_time_ms as i32,
         ]);
-        self.history_state.height = self
-            .history_state
-            .records
-            .len()
-            .saturating_mul(self.font_state.font_size().max(1) as usize)
-            .min(i32::MAX as usize) as i32;
+        self.refresh_history_layout_metrics();
     }
 
     fn text_reveal_duration_ms(
@@ -2842,18 +3044,18 @@ impl ScriptRuntime {
             .unwrap_or(0)
             .max(1) as u32;
         // Game.exe `text_w` (`sub_43FFC0`) stores the explicit duration in
-        // text_ctx+4196.  When that duration is zero, native computes the reveal
-        // span from the current task time unit and `text_speed / font_height`.
-        // The portable VM does not mirror the whole ADV text task object, so use
-        // the same dependency shape: more glyphs and smaller configured font
-        // heights take longer, while short one-word lines still stay visible
-        // long enough for the typewriter pass to be perceived before wait_click.
+        // text_ctx+4196.  When that duration is zero, native computes the
+        // reveal span from the configured message speed (task data +0x20)
+        // and the line length in font-height units, the same shape as the
+        // auto-mode hold (`speed * (len*24/font_height)`).  A speed of zero
+        // (slider at MAX) reveals instantly.
+        let speed = self.system_state.text_speed_percent().max(0) as u32;
+        if speed == 0 {
+            return 0;
+        }
         let font_height = self.text_state.init_font_size().max(1) as u32;
-        let per_char_ms = (1400_u32 / font_height).clamp(45, 95);
-        char_count
-            .saturating_mul(per_char_ms)
-            .clamp(220, 8000)
-            .max(self.text_wait_duration_ms().min(1800))
+        let line_units = char_count.saturating_mul(24) / font_height;
+        speed.saturating_mul(line_units.max(1)).clamp(60, 8000)
     }
 
     fn text_auto_hold_duration_ms(&self, text_value: i32, assets: &CoreAssets, nls: Nls) -> u32 {
@@ -2884,10 +3086,11 @@ impl ScriptRuntime {
         assets: &CoreAssets,
         nls: Nls,
     ) -> WaitRequest {
+        self.note_displayed_line(text_value, assets);
         let auto_ms = self.text_auto_hold_duration_ms(text_value, assets, nls);
         self.text_state.current_reveal_ms = reveal_ms;
         self.text_state.current_auto_hold_ms = auto_ms;
-        if self.text_skip_enabled || self.scene_skip_active {
+        if self.skip_engaged() {
             // Native skip completes the reveal in the same frame its text
             // tick sees the skip state and advances without a click; the
             // engine completes the reveal and the task layer completes the
@@ -2956,6 +3159,7 @@ impl ScriptRuntime {
             self.pressed_button = None;
         }
         let mut outcome = ButtonInputOutcome::default();
+        let mut left_push_hit_button = false;
         if input.mouse_push(PalMouseButton::Left) {
             if let Some((group, index)) = hovered {
                 self.button_push_queue
@@ -2965,6 +3169,7 @@ impl ScriptRuntime {
                 self.pressed_button = Some((group, index));
                 self.dispatch_button_push_compat(group, index);
                 outcome.consumed_mouse_push = true;
+                left_push_hit_button = true;
                 log::debug!(
                     "[trace-button] push latch group={group} index={index} pos=({mouse_x},{mouse_y})"
                 );
@@ -2979,23 +3184,37 @@ impl ScriptRuntime {
         // channel a cancel-button click uses — and PAL scripts cannot observe
         // raw input directly.  koikake binds its cancel handlers under both
         // slot 0 and 16 (settings COM_BTN_EXIT point 2127, backlog 戻る point
-        // 2900) and ADV quick actions under the wheel/arrow slots.  Native
-        // also suppresses the whole poll while any key is held and supports
-        // hold-repeat through KeyOnEx when `state` is non-zero; koikake keeps
-        // `state` at 0, so only push edges are dispatched here.
-        if input.mouse_push(PalMouseButton::Right) && self.queue_system_button_shortcut(0, input) {
+        // 2900) and ADV quick actions under the wheel/arrow slots.  Slots with
+        // a non-zero `state` hold-repeat (KeyOnEx) — koikake sets that on the
+        // backlog arrow keys; mouse/wheel slots stay push-edge only.
+        if input.mouse_push(PalMouseButton::Right)
+            && self.queue_system_button_shortcut(0, input, true, false)
+        {
             outcome.consumed_mouse_push = true;
         }
-        if input.mouse_push(PalMouseButton::Left) && self.queue_system_button_shortcut(3, input) {
+        if input.mouse_push(PalMouseButton::Left)
+            && !left_push_hit_button
+            && self.queue_system_button_shortcut(3, input, true, false)
+        {
+            // Slot 3 is the script's "left click landed on no game button"
+            // channel: koikake binds it to the dropdown cancel point (2182)
+            // while a shortcut menu is open.  Native only dispatches it when
+            // the PAL button layer did not consume the same click — otherwise
+            // selecting a menu item would race the cancel continuation and the
+            // close path runs twice (double set_priority unwind, leaving the
+            // priority cursor one lane high so the reopened menu renders
+            // behind the settings page).
             outcome.consumed_mouse_push = true;
         }
-        if input.wheel_delta() < 0.0 && self.queue_system_button_shortcut(1, input) {
+        if input.wheel_delta() < 0.0 && self.queue_system_button_shortcut(1, input, true, false) {
             outcome.consumed_push_edge = true;
         }
-        if input.wheel_delta() > 0.0 && self.queue_system_button_shortcut(2, input) {
+        if input.wheel_delta() > 0.0 && self.queue_system_button_shortcut(2, input, true, false) {
             outcome.consumed_push_edge = true;
         }
-        if input.key_push(PalKey::Escape) && self.queue_system_button_shortcut(16, input) {
+        if input.key_push(PalKey::Escape)
+            && self.queue_system_button_shortcut(16, input, true, false)
+        {
             outcome.consumed_push_edge = true;
         }
         let arrow_slots = [
@@ -3005,7 +3224,12 @@ impl ScriptRuntime {
             (20, PalKey::Right),
         ];
         for (slot, key) in arrow_slots {
-            if input.key_push(key) && self.queue_system_button_shortcut(slot, input) {
+            if self.queue_system_button_shortcut(
+                slot,
+                input,
+                input.key_push(key),
+                input.key_on(key),
+            ) {
                 outcome.consumed_push_edge = true;
             }
         }
@@ -3024,7 +3248,12 @@ impl ScriptRuntime {
             PalKey::F12,
         ];
         for (offset, key) in f_keys.into_iter().enumerate() {
-            if input.key_push(key) && self.queue_system_button_shortcut(4 + offset as i32, input) {
+            if self.queue_system_button_shortcut(
+                4 + offset as i32,
+                input,
+                input.key_push(key),
+                input.key_on(key),
+            ) {
                 outcome.consumed_push_edge = true;
             }
         }
@@ -3044,9 +3273,14 @@ impl ScriptRuntime {
             if !sprite.visible || sprite.color.alpha() == 0 {
                 continue;
             }
-            let row = if !entry.enabled || entry.locked {
+            // Lock is input-only in native (sub_40E0C0 stores a group lock
+            // flag); it must not change the rendered cell.  Koikake locks
+            // groups 4/5 while its shortcut dropdown is open, and treating
+            // locked as the disabled cell made every option render its
+            // "selected" frame at once.
+            let row = if !entry.enabled {
                 3
-            } else if hovered == Some((group, index)) {
+            } else if !entry.locked && hovered == Some((group, index)) {
                 if mouse_down {
                     2
                 } else {
@@ -3065,12 +3299,41 @@ impl ScriptRuntime {
     /// Queue the gosub point bound to one system-button slot.  Returns true
     /// when the slot has an enabled binding with a valid point id.  Native
     /// requires both the active and enable flags (system_btn_set initializes
-    /// enable to 1; system_btn_enable rewrites it).
-    fn queue_system_button_shortcut(&mut self, slot: i32, input: &PalInputState) -> bool {
-        let Some(entry) = self.system_buttons.get(&slot) else {
+    /// enable to 1; system_btn_enable rewrites it).  Slots registered with a
+    /// non-zero `state` repeat while the input is held (native KeyOnEx): the
+    /// first repeat comes after a longer delay, later ones every ~60ms —
+    /// koikake uses this for the backlog arrow-key scroll.
+    fn queue_system_button_shortcut(
+        &mut self,
+        slot: i32,
+        input: &PalInputState,
+        pushed: bool,
+        held: bool,
+    ) -> bool {
+        let now = self.pal_time_ms;
+        let Some(entry) = self.system_buttons.get_mut(&slot) else {
             return false;
         };
         if !entry.enabled || entry.image <= 0 {
+            return false;
+        }
+        let fire = if pushed {
+            entry.last_fired_ms = now;
+            entry.repeated = false;
+            true
+        } else if held && entry.state != 0 {
+            let interval = if entry.repeated { 60 } else { 400 };
+            if now.saturating_sub(entry.last_fired_ms) >= interval {
+                entry.last_fired_ms = now;
+                entry.repeated = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !fire {
             return false;
         }
         let point_id = entry.image as u32;
@@ -3220,6 +3483,34 @@ impl ScriptRuntime {
             ) {
                 Ok(StepResult::Continue) => {
                     executed += 1;
+                    if self.modal_repark_due() && !self.pending_gosub_points.is_empty() {
+                        // The modal handler returned but queued a follow-up
+                        // gosub (btn_set_hit re-dispatch).  Inject it on top of
+                        // the still-suspended wait instead of letting the script
+                        // run past the parked line.
+                        let point_id = self.pending_gosub_points.pop_front().unwrap();
+                        match assets.point_table.resolve_target_pc(point_id) {
+                            Ok(Some(target_pc)) => {
+                                self.call_stack.push(self.pc);
+                                self.pc = target_pc;
+                                log::debug!(
+                                    "[trace-button] injected queued modal gosub point[{point_id}] -> 0x{target_pc:08X} return=0x{:08X}",
+                                    self.call_stack.last().copied().unwrap_or(0)
+                                );
+                            }
+                            Ok(None) => {
+                                log::warn!(
+                                    "[trace-button] queued modal gosub point[{point_id}] resolved to no-op target, skipped"
+                                );
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "[trace-button] queued modal gosub point[{point_id}] resolve failed: {err}, skipped"
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(request) = self.take_modal_wait_repark() {
                         // The modal menu gosub returned to the PC right after
                         // the suspended ADV click wait; re-park there instead
@@ -4860,7 +5151,17 @@ impl ScriptRuntime {
             }
             0 => {
                 let args = self.pop_ext_args(1);
-                self.text_skip_enabled = args.first().copied().unwrap_or(0) != 0;
+                let enable = args.first().copied().unwrap_or(0) != 0;
+                if enable && self.system_state.skip_gate() == 0 && !self.current_line_read {
+                    // Gate A (koikake.exe 0x428E10): read-only skip mode
+                    // refuses to latch while the on-screen line is unread;
+                    // native posts the slot-1 cancel message and leaves the
+                    // skip byte untouched.
+                    log::debug!("[trace-text] skip_set refused: current line unread");
+                    self.post_engine_message(1, 0);
+                    return ExtCallOutcome::Value(1);
+                }
+                self.text_skip_enabled = enable;
                 log::debug!("[trace-text] skip_set enabled={}", self.text_skip_enabled);
                 ExtCallOutcome::Value(1)
             }
@@ -4879,11 +5180,12 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(self.text_auto_enabled as i32)
             }
             9 => {
-                // Game.exe sub_438810: effect_enable_is. It writes
-                // PalEffectEnableIs() to the extcall destination without
-                // popping any VM arguments.
+                // koikake.exe 0x428AE0 returns task data +8 (the live window
+                // mode written by window_change_mode) to the destination
+                // slot.  (The "effect_enable_is" naming came from a
+                // different Game.exe build.)
                 self.pop_ext_args(0);
-                ExtCallOutcome::Value(self.system_state.effect_enabled())
+                ExtCallOutcome::Value(self.system_state.window_mode())
             }
             4 => {
                 // Game.exe sub_4389F0: auto_set_speed. It pops one config value,
@@ -4903,10 +5205,16 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             7 => {
-                // Game.exe sub_4388F0: window_set_mode_cache. This only updates
-                // task-data +12 and does not post a PAL window-change message.
+                // koikake.exe 0x428B70 writes task data +0xC, whose only
+                // native consumers are the two skip gates (skip_set refusal
+                // on unread lines and the display-time cancel message):
+                // 0 = skip read text only, nonzero = skip everything.  The
+                // koikake SYSTEM screen's スキップタイプ toggle routes here.
+                // Other Game.exe builds use the same slot as a pending window
+                // mode cache, so keep that write as well.
                 let args = self.pop_ext_args(1);
                 let mode = args.first().copied().unwrap_or(0);
+                self.system_state.set_skip_gate(mode);
                 self.system_state.set_window_mode_cache(mode);
                 ExtCallOutcome::Value(1)
             }
@@ -4919,9 +5227,12 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             10 => {
-                // Game.exe sub_438830: return cached task-data +12 window mode.
+                // koikake.exe 0x428AB0 returns task data +0xC: the value
+                // written by index 7 (skip-type gate; a pending window-mode
+                // cache in other Game.exe builds).  The koikake SYSTEM
+                // screen syncs its スキップタイプ toggle from this getter.
                 self.pop_ext_args(0);
-                ExtCallOutcome::Value(self.system_state.window_mode_cache())
+                ExtCallOutcome::Value(self.system_state.skip_gate())
             }
             21 => {
                 // Game.exe memory_stack_push snapshots one 0x4000-byte task work
@@ -5360,30 +5671,29 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             9 => {
-                // Adjacent to native `text_clear` in the category-2 table and
-                // reachable from the SOUND/SYSTEM setup path.  IDB evidence
-                // confirms zero arguments for this slot; treat it as the
-                // repaint/clear hook that resets transient text reveal state
-                // without tearing down the text subsystem.
-                self.pop_ext_args(0);
-                self.text_state.reveal_enabled = false;
-                self.text_state.pending_alpha.clear();
-                self.text_state.last_event_time_ms = self.pal_time_ms;
-                self.text_state.dirty = true;
-                log::debug!("[trace-text] text_clear_ex");
+                // koikake.exe category-2 index 9 is the message-speed setter:
+                // the SYSTEM screen text-speed slider pushes `100 - percent`
+                // here (its only script use), and native stores the value at
+                // task data +0x20 with the same 0..100 units as auto speed.
+                // The older "text_clear_ex" reading came from a neighboring
+                // slot in a different Game.exe build and does not match this
+                // call pattern.
+                let args = self.pop_ext_args(1);
+                let speed = args.first().copied().unwrap_or(0);
+                self.system_state.set_text_speed_percent(speed);
+                log::debug!(
+                    "[trace-text] text_set_speed speed={}",
+                    self.system_state.text_speed_percent()
+                );
                 ExtCallOutcome::Value(1)
             }
             10 => {
-                // VmExtcall_TextGetTime @ 0x0043F010 does not pop arguments.
-                // It writes PalTaskGetTaskData(0)+32 (current task time) to the
-                // extcall destination slot.  The portable VM exposes the same
-                // observable value as elapsed PAL time since the last text event.
+                // Category-2 index 10 returns the configured message speed
+                // (native writes task data +0x20 to the destination slot).
+                // The SYSTEM screen computes its slider percent as
+                // `100 - speed` when the page opens.
                 self.pop_ext_args(0);
-                let elapsed = self
-                    .pal_time_ms
-                    .wrapping_sub(self.text_state.last_event_time_ms)
-                    as i32;
-                ExtCallOutcome::Value(elapsed)
+                ExtCallOutcome::Value(self.system_state.text_speed_percent())
             }
             11 => {
                 let args = self.pop_ext_args(2);
@@ -6246,6 +6556,12 @@ impl ScriptRuntime {
                         log::warn!("[trace-save] savesystemdata system_mem failed: {err}");
                         return ExtCallOutcome::Value(0);
                     }
+                    // The read-text bitmap is part of the native system.dat
+                    // state as well (koikake.exe 0x438F00).
+                    if let Err(err) = self.write_portable_read_lines(manager.root()) {
+                        log::warn!("[trace-save] savesystemdata read lines failed: {err}");
+                        return ExtCallOutcome::Value(0);
+                    }
                 }
                 ExtCallOutcome::Value(1)
             }
@@ -6899,6 +7215,8 @@ impl ScriptRuntime {
                         // system_btn_set initializes the enable flag to 1;
                         // system_btn_enable rewrites it afterwards.
                         enabled: true,
+                        last_fired_ms: 0,
+                        repeated: false,
                     },
                 );
                 log::debug!("[trace-system-button] set slot={slot} image={image} state={state}");
@@ -6973,6 +7291,11 @@ impl ScriptRuntime {
             1 => {
                 self.pop_ext_args(0);
                 self.history_state.active = true;
+                // Native history_begin lays the records out and then calls
+                // apply_scroll(ctx, 0): the view opens on the newest records
+                // (scroll position 0).
+                self.history_state.scroll_y = 0;
+                self.refresh_history_layout_metrics();
                 log::debug!(
                     "[trace-history] history_begin records={} height={}",
                     self.history_state.records.len(),
@@ -6987,31 +7310,36 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             3 => {
+                // Native VmExtcall_HistScroll returns ctx+0x5D9C, the history
+                // record count (koikake's log screen treats 0 as "nothing to
+                // show" and aborts).
                 self.pop_ext_args(0);
-                let can_open = i32::from(!self.history_state.records.is_empty());
-                log::debug!(
-                    "[trace-history] history_can_open records={} -> {can_open}",
-                    self.history_state.records.len()
-                );
-                ExtCallOutcome::Value(can_open)
+                let count = self.history_state.records.len() as i32;
+                log::debug!("[trace-history] history_scroll records={count}");
+                ExtCallOutcome::Value(count)
             }
             4 => {
+                // Native history_set_pos (0x41F1A0/0x41F800) clamps the new
+                // position to the record count and re-lays the view out from
+                // that record upward; the unit is records, not pixels.
                 let args = self.pop_ext_args(1);
-                self.history_state.scroll_y = args.first().copied().unwrap_or(0).max(0);
-                log::debug!(
-                    "[trace-history] history_set_pos scroll_y={}",
-                    self.history_state.scroll_y
-                );
+                let count = self.history_state.records.len() as i32;
+                let pos = args.first().copied().unwrap_or(0).clamp(0, count);
+                self.history_state.scroll_y = pos;
+                log::debug!("[trace-history] history_set_pos pos={pos}");
                 ExtCallOutcome::Value(1)
             }
             5 => {
+                // Native returns ctx+0x5D64: the laid-out pixel height of all
+                // records; koikake's log screen compares it against 620 to
+                // decide whether the scrollbar branch is needed.
                 self.pop_ext_args(0);
                 ExtCallOutcome::Value(self.history_state.height)
             }
             6 => {
                 self.pop_ext_args(0);
                 log::debug!(
-                    "[trace-history] history_update active={} scroll_y={} height={}",
+                    "[trace-history] history_update active={} pos={} height={}",
                     self.history_state.active,
                     self.history_state.scroll_y,
                     self.history_state.height
@@ -7019,19 +7347,23 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             7 => {
+                // Native returns ctx+0x5D70: current scroll position in
+                // records (0 = newest).
                 self.pop_ext_args(0);
                 ExtCallOutcome::Value(self.history_state.scroll_y)
             }
             8 => {
+                // Native returns ctx+0x5D6C: the maximum scroll position in
+                // records, i.e. how many of the oldest records do not fit into
+                // the view when it is filled from the newest backward.
                 self.pop_ext_args(0);
-                let line = self.font_state.font_size().max(1) as i32;
-                ExtCallOutcome::Value(line)
+                ExtCallOutcome::Value(self.history_max_scroll_pos())
             }
             9 => {
+                // Native returns ctx+0x5D98: the number of record sprites that
+                // fit in the view.
                 self.pop_ext_args(0);
-                let visible_height = (self.history_state.rect[3] - self.history_state.rect[1])
-                    .max(self.font_state.font_size() as i32);
-                ExtCallOutcome::Value(visible_height)
+                ExtCallOutcome::Value(self.history_visible_capacity() as i32)
             }
             10 => {
                 let args = self.pop_ext_args(4);
@@ -9168,16 +9500,21 @@ impl ScriptRuntime {
     }
 
     /// `btn_set_hit(group, index)` matches Game category 8 index 22
-    /// (sub_40DD90): native code calls PalButtonSetReaction for the stored
-    /// button cell.  The portable renderer keeps reaction geometry in the
-    /// sprite/button entry itself, so this clears any compatibility hit-rect
-    /// override and lets normal button bounds drive future reactions.
+    /// (koikake.exe sub_40DD90): native resolves the stored button handle and
+    /// calls PalButtonSetReaction(handle, 1), which arms the same "reaction"
+    /// flag a real mouse click sets (plus a one-shot click-SE latch).  The
+    /// engine's next button poll consumes it exactly like a physical hit, so
+    /// the portable runtime injects the click through the same push queue and
+    /// gosub-compat channel a mouse press uses.  koikake's F-key shortcut
+    /// points (e.g. SAVE -> btn_set_hit(0, 5)) are pure re-dispatchers onto
+    /// the on-screen ADV buttons and break entirely without this.
     fn ext_btn_set_hit(&mut self) -> ExtCallOutcome {
         let args = self.pop_ext_args(2);
         let group = args.first().copied().unwrap_or(-1);
         let index = args.get(1).copied().unwrap_or(-1);
-        for entry in self.matching_button_entries_mut(group, index) {
-            entry.hit_rect = None;
+        if self.game_buttons.contains_key(&(group, index)) {
+            self.button_push_queue.entry(group).or_default().push_back(index);
+            self.dispatch_button_push_compat(group, index);
         }
         log::debug!("[trace-button] btn_set_hit group={group} index={index}");
         ExtCallOutcome::Value(1)
@@ -15769,6 +16106,52 @@ fn portable_system_mem_path(root: &Path) -> PathBuf {
     portable_save_dir(root).join("system_mem.bin")
 }
 
+fn portable_read_lines_path(root: &Path) -> PathBuf {
+    portable_save_dir(root).join("read_lines.bin")
+}
+
+const PORTABLE_READ_LINES_MAGIC: &[u8; 8] = b"SENARLIN";
+const PORTABLE_READ_LINES_VERSION: u32 = 1;
+
+fn encode_portable_read_lines(ids: &BTreeSet<u32>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16 + ids.len() * 4);
+    bytes.extend_from_slice(PORTABLE_READ_LINES_MAGIC);
+    bytes.extend_from_slice(&PORTABLE_READ_LINES_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for id in ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_portable_read_lines(bytes: &[u8]) -> std::io::Result<BTreeSet<u32>> {
+    if bytes.len() < 16 || &bytes[..8] != PORTABLE_READ_LINES_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad SENARLIN header",
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != PORTABLE_READ_LINES_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported SENARLIN version {version}"),
+        ));
+    }
+    let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    if bytes.len() < 16 + count * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated SENARLIN body",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for chunk in bytes[16..16 + count * 4].chunks_exact(4) {
+        ids.insert(u32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(ids)
+}
+
 const PORTABLE_SYSTEM_MEM_MAGIC: &[u8; 8] = b"SENARMEM";
 const PORTABLE_SYSTEM_MEM_VERSION: u32 = 1;
 
@@ -17018,6 +17401,17 @@ fn read_text_record_string(bytes: &[u8], offset: usize, nls: Nls) -> Option<Stri
     read_c_string(bytes, start, nls)
 }
 
+/// Text-pool record id (the 4-byte header read_text_record_string skips).
+/// koikake.exe 0x42CBD0 uses it as the bit number in the read-text bitmap.
+fn text_pool_record_id(text_value: i32, assets: &CoreAssets) -> Option<u32> {
+    if text_value == 0x0FFF_FFFF || dynamic_string_index(text_value).is_some() {
+        return None;
+    }
+    let offset: usize = text_value.try_into().ok()?;
+    let bytes = assets.text_dat.bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
 fn read_c_string(bytes: &[u8], offset: usize, nls: Nls) -> Option<String> {
     if offset >= bytes.len() {
         return None;
@@ -18059,7 +18453,9 @@ mod tests {
         assert!(matches!(runtime.status, RuntimeStatus::Running { pc: 0x2000 }));
         assert_eq!(runtime.modal_wait_suspensions.len(), 1);
 
-        // The engine injects the menu gosub: push the parked PC and jump.
+        // The engine injects the menu gosub: drain the queued point, push the
+        // parked PC, and jump.
+        assert_eq!(runtime.pending_gosub_points.pop_front(), Some(7));
         runtime.call_stack.push(0x2000);
         runtime.pc = 0x9000;
         // Still inside the modal; no re-park yet.

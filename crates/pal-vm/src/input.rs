@@ -363,9 +363,22 @@ impl PalInputState {
     }
 
     /// True if any key, mouse button, or positive mouse wheel input was pushed this frame.
-    /// Used by WaitClick tasks.
     pub fn any_push(&self) -> bool {
         self.key_push != 0 || self.mouse_push != 0 || self.wheel_delta > 0.0
+    }
+
+    /// True if a push this frame counts as a "click" that completes PAL click
+    /// waits and the ADV typewriter reveal.
+    ///
+    /// Mirrors the push half of koikake.exe GetSkipState (0x437800): Space or
+    /// Return push (PalInputGetKeyPush & 0x6), left mouse push (& 0x800000),
+    /// or positive wheel delta (PalInputGetWheel > 0) set bit 3. Other keys
+    /// (Escape, arrows, F-keys, right/middle mouse) never complete click
+    /// waits; they reach scripts only through system-button slots.
+    pub fn click_push(&self) -> bool {
+        self.key_push & (KEY_SPACE | KEY_RETURN) != 0
+            || self.mouse_push & MOUSE_LEFT != 0
+            || self.wheel_delta > 0.0
     }
 
     /// True while the PAL fast-forward modifier is held.

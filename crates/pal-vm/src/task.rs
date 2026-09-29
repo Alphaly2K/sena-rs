@@ -536,11 +536,13 @@ impl TaskSystem {
             TaskKind::WaitClick => {
                 // Native wait-click consumers poll GetSkipState every frame:
                 // any latched skip mode (skip byte, scene skip, held Ctrl)
-                // completes the wait just like an input push.
-                if input.any_push() || skip_active {
+                // completes the wait just like a click push. Only the native
+                // click set (Space/Return/left mouse/wheel up) qualifies;
+                // Escape, arrows and F-keys must not advance text.
+                if input.click_push() || skip_active {
                     log::debug!(
-                        "[trace-wait] wait_click complete idx={idx} any_push={} skip_active={skip_active} pal_time_ms={pal_time_ms}",
-                        input.any_push()
+                        "[trace-wait] wait_click complete idx={idx} click_push={} skip_active={skip_active} pal_time_ms={pal_time_ms}",
+                        input.click_push()
                     );
                     TaskUpdateOutcome::FreeSelf
                 } else {
@@ -557,10 +559,10 @@ impl TaskSystem {
                 // voice playback has ended; skip state and input always
                 // complete immediately (koikake.exe 0x42F9D0/0x4326DF).
                 let timed_out = elapsed >= *duration_ms && !(*voice_gated && voice_active);
-                if input.any_push() || skip_active || timed_out {
+                if input.click_push() || skip_active || timed_out {
                     log::debug!(
-                        "[trace-wait] wait_click_or_time complete idx={idx} any_push={} skip_active={skip_active} elapsed={elapsed} duration_ms={duration_ms} voice_gated={voice_gated} voice_active={voice_active}",
-                        input.any_push()
+                        "[trace-wait] wait_click_or_time complete idx={idx} click_push={} skip_active={skip_active} elapsed={elapsed} duration_ms={duration_ms} voice_gated={voice_gated} voice_active={voice_active}",
+                        input.click_push()
                     );
                     TaskUpdateOutcome::FreeSelf
                 } else {
