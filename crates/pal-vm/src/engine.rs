@@ -421,7 +421,10 @@ impl Engine {
             .process(&mut self.sprites, input_for_tasks, skip_active, voice_active);
         let delta_ms = timing.delta.as_millis().min(u32::MAX as u128) as u32;
         self.sprites.advance_motion_entries(delta_ms);
-        self.sprites.advance_transitions(delta_ms);
+        // Native completes in-flight sprite transitions on the same frame a
+        // skip state is active instead of playing the remaining frames out.
+        let transition_delta = if skip_active { i32::MAX as u32 } else { delta_ms };
+        self.sprites.advance_transitions(transition_delta);
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.set_pal_time(self.task_system.pal_time_ms);
             runtime.advance_sprite_action_lanes(&mut self.sprites);

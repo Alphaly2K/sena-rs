@@ -1130,15 +1130,67 @@ struct HistorySubsystemState {
     colors: [i32; 2],
     layout: [i32; 7],
     current_text_value: i32,
-    /// Native ctx+0x5D64: total pixel height of the laid-out backlog text.
+    /// Native ctx+0x5D68: total pixel height of the laid-out backlog text.
     height: i32,
     /// Native ctx+0x5D70: scroll position in RECORD units; 0 shows the newest
     /// records at the bottom of the view and `max` shows the oldest.
     scroll_y: i32,
     active: bool,
     records: Vec<[i32; 9]>,
+    /// Bumped on every records mutation; the wrapped layout cache keys on it.
+    records_generation: u64,
+    layout_cache: Option<HistoryLayoutCache>,
+    /// Record index under the mouse, maintained by history_update (idx6).
+    hovered_record: Option<usize>,
     skipped: bool,
     sprite: Option<SpriteHandle>,
+}
+
+/// Wrapped per-record layout for the backlog view.  Rebuilt lazily whenever
+/// the record list, view rect, or wrap-relevant font metrics change.
+///
+/// Field semantics recovered from koikake.exe: a record is a name block
+/// (history_init arg4 = 40px tall when present) stacked above a body block
+/// (wrapped at the ADV body width, ADV font size, pitch = size + arg0), with
+/// history_init arg7 = 16px between records.  apply_scroll (0x41F800) fills
+/// the view from the BOTTOM up, placing the newest visible record's body at
+/// the view bottom; a record whose top would cross the view top is dropped
+/// entirely rather than clipped.
+#[derive(Clone, Debug)]
+struct HistoryLayoutCache {
+    generation: u64,
+    rect: [i32; 4],
+    /// Rasterized glyph height at the backlog font size (no leading).
+    line_height: i32,
+    /// Line pitch inside a body block: font size + text_init's first arg.
+    pitch: i32,
+    /// Name-block height (history_init arg4).
+    name_block: i32,
+    /// Inter-record gap (history_init arg7).
+    record_gap: i32,
+    /// Body text x offset inside the view (history_init arg3).
+    body_x: i32,
+    /// Name text x offset inside the view (history_init arg1).
+    name_x: i32,
+    records: Vec<HistoryRecordLayout>,
+    /// Total laid-out pixel height (native ctx+0x5D68, history_get_height).
+    total_height: i32,
+    /// Records visible when the view is filled from the newest record up.
+    visible_from_bottom: usize,
+    /// Native ctx+0x5D6C: maximum scroll position in record units.
+    max_pos: i32,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryRecordLayout {
+    name: Option<String>,
+    body_lines: Vec<String>,
+    /// Body block pixel height (wrapped lines * pitch).
+    body_height: i32,
+    /// Full record slot height: name block + body + trailing record gap.
+    slot_height: i32,
+    /// The record carries a voice clip (eligible for hover/replay).
+    has_voice: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2669,53 +2721,86 @@ impl ScriptRuntime {
 
         let saved_size = self.font_state.font_size();
         let saved_color = self.font_state.color();
-        self.font_state.set_font_size(24);
-        self.font_state.set_color(0xFF20_2020, 0x0000_0000);
+        let (font_size, wrap_width, pitch, name_block, _, body_x, name_x) =
+            self.history_typeset_params();
+        self.font_state.set_font_size(font_size);
 
         // Native scroll positions are record indices: 0 anchors the newest
         // record at the bottom of the view, and each step toward `max` moves
-        // one record further into the past.  Slice the visible window out of
-        // the chronological record list instead of pixel-shifting the tail.
-        let count = self.history_state.records.len();
-        let pitch = self.history_line_pitch();
-        let visible = ((height as i32 / pitch).max(1)) as usize;
-        let pos = (self.history_state.scroll_y.max(0) as usize)
-            .min(count.saturating_sub(visible));
-        let end = count.saturating_sub(pos);
-        let start = end.saturating_sub(visible.max(1));
-        let mut y = 0i32;
-        for record in &self.history_state.records[start..end] {
-            let record = *record;
-            let body = self
-                .resolved_dialog_text_arg(record[1], assets, nls)
-                .unwrap_or_default();
-            let name = self
-                .resolved_dialog_text_arg(record[2], assets, nls)
-                .unwrap_or_default();
-            if body.is_empty() {
-                continue;
+        // one record further into the past.  Draw the window the shared
+        // layout cache computed so wrapping, scroll math, and hit-testing all
+        // agree.
+        let hovered = self.history_state.hovered_record;
+        let (start, _end, tops) = self.history_visible_window(assets, nls);
+        let records = self
+            .history_state
+            .layout_cache
+            .as_ref()
+            .expect("history_visible_window installs the cache")
+            .records
+            .clone();
+        let hover_text_color = self.history_state.colors[1] as u32;
+        for (offset, record_top) in tops.iter().enumerate() {
+            let record_index = start + offset;
+            let record = &records[record_index];
+            let record_top = *record_top;
+            let body_top = record_top + if record.name.is_some() { name_block } else { 0 };
+            let hovered_record = Some(record_index) == hovered && record.has_voice;
+            if hovered_record && record.body_height > 0 {
+                // Native hover feedback (history_update 0x41EF20): an opaque
+                // dark plate (hardcoded 0xFF4E4E4E) behind the body block,
+                // with the text redrawn in the second history color.
+                let plate_top = body_top.max(0) as u32;
+                let plate_height = record.body_height as u32;
+                let plate_left = (body_x - 8).max(0) as u32;
+                let plate_right = (body_x + wrap_width as i32 + font_size as i32)
+                    .clamp(0, width as i32) as u32;
+                for by in plate_top..(plate_top + plate_height).min(height) {
+                    for bx in plate_left..plate_right {
+                        let di = ((by * width + bx) * 4) as usize;
+                        alpha_blend_rgba(&mut rgba[di..di + 4], &[0x4E, 0x4E, 0x4E, 0xC0]);
+                    }
+                }
             }
-            let line = if name.is_empty() {
-                body
+            let text_color = if hovered_record {
+                hover_text_color
             } else {
-                format!("{name}  {body}")
+                0xFF20_2020
             };
-            let (line_width, line_height, line_rgba) = self.font_state.rasterize(&line);
-            if y < height as i32 {
+            self.font_state.set_color(text_color, 0x0000_0000);
+            if let Some(name) = &record.name {
+                let (line_width, line_raster_height, line_rgba) = self.font_state.rasterize(name);
                 blit_rgba(
                     &mut rgba,
                     width,
                     height,
                     &line_rgba,
                     line_width,
-                    line_height,
-                    0,
-                    y.max(0) as u32,
+                    line_raster_height,
+                    name_x.max(0) as u32,
+                    record_top.max(0) as u32,
                 );
             }
-            y = y.saturating_add(line_height as i32 + 10);
-            if y >= height as i32 {
-                break;
+            let mut y = body_top;
+            for line in &record.body_lines {
+                if y >= height as i32 {
+                    break;
+                }
+                if !line.is_empty() {
+                    let (line_width, line_raster_height, line_rgba) =
+                        self.font_state.rasterize(line);
+                    blit_rgba(
+                        &mut rgba,
+                        width,
+                        height,
+                        &line_rgba,
+                        line_width,
+                        line_raster_height,
+                        body_x.max(0) as u32,
+                        y.max(0) as u32,
+                    );
+                }
+                y = y.saturating_add(pitch);
             }
         }
 
@@ -2952,43 +3037,182 @@ impl ScriptRuntime {
         500_u32.saturating_add(chars.saturating_mul(350)).min(3500)
     }
 
-    /// Pixel pitch of one backlog line: rasterized 24px line plus the layout
-    /// gap the native log layout adds between records.
-    fn history_line_pitch(&mut self) -> i32 {
-        let saved_size = self.font_state.font_size();
-        self.font_state.set_font_size(24);
-        let (_, probe_height, _) = self.font_state.rasterize("あ");
-        self.font_state.set_font_size(saved_size);
-        (probe_height as i32 + 10).max(1)
+    /// Backlog typesetting parameters, recovered from koikake.exe
+    /// historybegin (0x41F2C0): the records are typeset with the ADV text
+    /// configuration from text_init — font size (arg8), body wrap width
+    /// (arg5), pitch = font size + arg1 (or +2 when arg1 is 0).  history_init
+    /// contributes the name/body x offsets (arg1/arg3), the name block height
+    /// (arg4), and the inter-record gap (arg7).
+    fn history_typeset_params(&self) -> (u16, u32, i32, i32, i32, i32, i32) {
+        let layout = self.history_state.layout;
+        let (font_size, wrap_width, pitch_extra) = if self.text_state.initialized {
+            (
+                self.text_state.init_args[7].max(1) as u16,
+                self.text_state.init_args[4].max(1) as u32,
+                self.text_state.init_args[0],
+            )
+        } else {
+            let view = (self.history_state.rect[2] - self.history_state.rect[0]).max(1);
+            (24, (view - layout[0].max(0) - layout[2].max(0)).max(1) as u32, 0)
+        };
+        let pitch = font_size as i32 + if pitch_extra != 0 { pitch_extra } else { 2 };
+        (
+            font_size,
+            wrap_width,
+            pitch.max(1),
+            layout[3].max(0),
+            layout[6].max(0),
+            layout[2].max(0),
+            layout[0].max(0),
+        )
     }
 
-    /// Recompute the pixel height native history_begin/history_get_height
-    /// report (records * pitch minus one trailing gap).
-    fn refresh_history_layout_metrics(&mut self) {
-        let count = self.history_state.records.len() as i32;
-        if count == 0 {
-            self.history_state.height = 0;
+    /// Rebuild the wrapped backlog layout when the record list or the view
+    /// rect changed.  All wrapped-line consumers (height, capacity, max
+    /// scroll pos, renderer) read this one cache so scroll math and drawing
+    /// can never disagree.
+    fn rebuild_history_layout(&mut self, assets: &CoreAssets, nls: Nls) {
+        let generation = self.history_state.records_generation;
+        let rect = self.history_state.rect;
+        if self
+            .history_state
+            .layout_cache
+            .as_ref()
+            .is_some_and(|cache| cache.generation == generation && cache.rect == rect)
+        {
             return;
         }
-        let pitch = self.history_line_pitch();
-        self.history_state.height = count.saturating_mul(pitch).saturating_sub(10);
+
+        let (font_size, wrap_width, pitch, name_block, record_gap, body_x, name_x) =
+            self.history_typeset_params();
+
+        let saved_size = self.font_state.font_size();
+        let saved_color = self.font_state.color();
+        self.font_state.set_font_size(font_size);
+        self.font_state.set_color(0xFF20_2020, 0x0000_0000);
+
+        let line_height = {
+            let (_, probe_height, _) = self.font_state.rasterize("あ");
+            (probe_height as i32).max(1)
+        };
+        let view_height = (rect[3] - rect[1]).max(1);
+
+        let mut records = Vec::with_capacity(self.history_state.records.len());
+        let mut total_height = 0i32;
+        for record in &self.history_state.records {
+            let body = self
+                .resolved_dialog_text_arg(record[1], assets, nls)
+                .unwrap_or_default();
+            let name = self
+                .resolved_dialog_text_arg(record[2], assets, nls)
+                .filter(|name| !name.is_empty());
+            let body_lines = if body.is_empty() {
+                Vec::new()
+            } else {
+                wrap_text_lines(&self.font_state, &body, wrap_width)
+            };
+            let body_height = body_lines.len() as i32 * pitch;
+            let slot_height = if body_height == 0 && name.is_none() {
+                0
+            } else {
+                name.as_ref().map_or(0, |_| name_block) + body_height + record_gap
+            };
+            total_height = total_height.saturating_add(slot_height);
+            records.push(HistoryRecordLayout {
+                name,
+                body_lines,
+                body_height,
+                slot_height,
+                has_voice: record[3] != 0 && record[3] != 0x0FFF_FFFF,
+            });
+        }
+        total_height = total_height.saturating_sub(record_gap).max(0);
+
+        // apply_scroll fills from the newest record upward and drops a record
+        // whose top would cross the view top, so the capacity is exactly the
+        // tail-fill count.
+        let mut y = view_height;
+        let mut visible_from_bottom = 0usize;
+        for record in records.iter().rev() {
+            y -= record.slot_height;
+            if y < 0 {
+                break;
+            }
+            visible_from_bottom += 1;
+        }
+        let max_pos = records.len().saturating_sub(visible_from_bottom) as i32;
+
+        self.font_state.set_font_size(saved_size);
+        self.font_state.set_color(saved_color.0, saved_color.1);
+
+        self.history_state.height = total_height;
+        self.history_state.layout_cache = Some(HistoryLayoutCache {
+            generation,
+            rect,
+            line_height,
+            pitch,
+            name_block,
+            record_gap,
+            body_x,
+            name_x,
+            records,
+            total_height,
+            visible_from_bottom,
+            max_pos,
+        });
+    }
+
+    /// Records visible at the current scroll position: `(start, end, tops)`
+    /// where `tops[i]` is the view-relative top y of record `start + i`'s
+    /// name/body stack.  The window ends `pos` records before the newest and
+    /// fills bottom-up; like native apply_scroll (0x41F800), a record whose
+    /// top would cross the view top is dropped rather than clipped.
+    fn history_visible_window(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+    ) -> (usize, usize, Vec<i32>) {
+        self.rebuild_history_layout(assets, nls);
+        let (rect, records, max_pos) = {
+            let cache = self
+                .history_state
+                .layout_cache
+                .as_ref()
+                .expect("rebuild_history_layout always installs the cache");
+            (cache.rect, cache.records.clone(), cache.max_pos)
+        };
+        let count = records.len();
+        let view_height = (rect[3] - rect[1]).max(1);
+        let pos = (self.history_state.scroll_y.max(0) as usize).min(max_pos.max(0) as usize);
+        let end = count.saturating_sub(pos);
+        // Stack from the bottom of the view upward.
+        let mut y = view_height;
+        let mut start = end;
+        let mut tops_rev = Vec::new();
+        for index in (0..end).rev() {
+            let slot = records[index].slot_height;
+            let top = y - slot;
+            if top < 0 {
+                break;
+            }
+            tops_rev.push(top);
+            y = top;
+            start = index;
+        }
+        tops_rev.reverse();
+        (start, end, tops_rev)
+    }
+
+    /// Wrapped layout, rebuilding when stale.
+    fn history_layout(&mut self, assets: &CoreAssets, nls: Nls) -> &HistoryLayoutCache {
+        self.rebuild_history_layout(assets, nls);
+        self.history_state
+            .layout_cache
+            .as_ref()
+            .expect("rebuild_history_layout always installs the cache")
     }
 
     /// How many record lines fit into the history view rect.
-    fn history_visible_capacity(&mut self) -> usize {
-        let pitch = self.history_line_pitch();
-        let view = (self.history_state.rect[3] - self.history_state.rect[1]).max(1);
-        (view / pitch).max(1) as usize
-    }
-
-    /// Native ctx+0x5D6C: maximum scroll position in record units.
-    fn history_max_scroll_pos(&mut self) -> i32 {
-        let visible = self.history_visible_capacity();
-        self.history_state
-            .records
-            .len()
-            .saturating_sub(visible) as i32
-    }
 
     fn push_history_text_record(&mut self, text_args: [i32; 4]) {
         if !self.text_state.history_enabled {
@@ -3008,7 +3232,12 @@ impl ScriptRuntime {
         }
         // Native history records carry text/name/voice/face fields.  Store the
         // script string handles in source order so the history UI and save-data
-        // layer can recover the same resources later.
+        // layer can recover the same resources later.  The native record array
+        // holds 128 entries (0x80 * 0x21E bytes); when full the oldest record
+        // is shifted out.
+        if self.history_state.records.len() >= 128 {
+            self.history_state.records.remove(0);
+        }
         self.history_state.records.push([
             text_args[0],
             text_args[1],
@@ -3020,7 +3249,9 @@ impl ScriptRuntime {
             self.text_state.mode,
             self.pal_time_ms as i32,
         ]);
-        self.refresh_history_layout_metrics();
+        self.history_state.records_generation += 1;
+        // The wrapped layout cache is rebuilt lazily by history_begin or the
+        // next layout query; no eager metric work is needed per line.
     }
 
     fn text_reveal_duration_ms(
@@ -4808,14 +5039,30 @@ impl ScriptRuntime {
                 "system_btn_enable" if category == 12 => {
                     return self.dispatch_system_button_stub(2)
                 }
-                "history_init_0x_0x" => return self.dispatch_history_stub(0),
-                "historybegin_lpbyte_ptagdata_sztext" => return self.dispatch_history_stub(1),
-                "history_end" => return self.dispatch_history_stub(2),
-                "history_get_height" => return self.dispatch_history_stub(5),
-                "history_set_rect" => return self.dispatch_history_stub(10),
-                "history_clear" => return self.dispatch_history_stub(11),
-                "history_set" => return self.dispatch_history_stub(12),
-                "history_get_text" => return self.dispatch_history_stub(20),
+                "history_init_0x_0x" => {
+                    return self.dispatch_history_stub(0, assets, nls, resource_manager, audio, input)
+                }
+                "historybegin_lpbyte_ptagdata_sztext" => {
+                    return self.dispatch_history_stub(1, assets, nls, resource_manager, audio, input)
+                }
+                "history_end" => {
+                    return self.dispatch_history_stub(2, assets, nls, resource_manager, audio, input)
+                }
+                "history_get_height" => {
+                    return self.dispatch_history_stub(5, assets, nls, resource_manager, audio, input)
+                }
+                "history_set_rect" => {
+                    return self.dispatch_history_stub(10, assets, nls, resource_manager, audio, input)
+                }
+                "history_clear" => {
+                    return self.dispatch_history_stub(11, assets, nls, resource_manager, audio, input)
+                }
+                "history_set" => {
+                    return self.dispatch_history_stub(12, assets, nls, resource_manager, audio, input)
+                }
+                "history_get_text" => {
+                    return self.dispatch_history_stub(20, assets, nls, resource_manager, audio, input)
+                }
                 "movie_play" => {
                     return self.ext_movie_play(
                         assets,
@@ -4901,7 +5148,7 @@ impl ScriptRuntime {
             9 => self.dispatch_font_system_stub(index, input),
             10 => self.dispatch_save_stub(index, assets, nls, resource_manager, sprites),
             12 => self.dispatch_system_button_stub(index),
-            14 => self.dispatch_history_stub(index),
+            14 => self.dispatch_history_stub(index, assets, nls, resource_manager, audio, input),
             6 => self.dispatch_select_stub(index),
             15 => self.dispatch_misc_system_stub(index, assets.extended_softpal),
             16 => self.dispatch_window_effect_stub(index),
@@ -7269,7 +7516,15 @@ impl ScriptRuntime {
     /// script control flow and UI sizing, returning integer status or record
     /// counts. Text wrapping and scroll geometry are implemented in the
     /// portable renderer using the recovered history layout state.
-    fn dispatch_history_stub(&mut self, index: u16) -> ExtCallOutcome {
+    fn dispatch_history_stub(
+        &mut self,
+        index: u16,
+        assets: &CoreAssets,
+        nls: Nls,
+        resource_manager: Option<&mut ResourceManager>,
+        mut audio: Option<&mut AudioSystem>,
+        input: Option<&PalInputState>,
+    ) -> ExtCallOutcome {
         match index {
             0 => {
                 let args = self.pop_ext_args(9);
@@ -7286,6 +7541,12 @@ impl ScriptRuntime {
                 ];
                 let (logical_width, logical_height) = self.logical_size();
                 self.history_state.rect = [0, 0, logical_width as i32, logical_height as i32];
+                log::debug!(
+                    "[trace-history] history_init layout={:?} colors=[0x{:08X},0x{:08X}]",
+                    self.history_state.layout,
+                    self.history_state.colors[0],
+                    self.history_state.colors[1]
+                );
                 ExtCallOutcome::Value(1)
             }
             1 => {
@@ -7295,7 +7556,8 @@ impl ScriptRuntime {
                 // apply_scroll(ctx, 0): the view opens on the newest records
                 // (scroll position 0).
                 self.history_state.scroll_y = 0;
-                self.refresh_history_layout_metrics();
+                self.history_state.hovered_record = None;
+                self.rebuild_history_layout(assets, nls);
                 log::debug!(
                     "[trace-history] history_begin records={} height={}",
                     self.history_state.records.len(),
@@ -7330,20 +7592,84 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             5 => {
-                // Native returns ctx+0x5D64: the laid-out pixel height of all
+                // Native returns ctx+0x5D68: the laid-out pixel height of all
                 // records; koikake's log screen compares it against 620 to
                 // decide whether the scrollbar branch is needed.
                 self.pop_ext_args(0);
+                self.rebuild_history_layout(assets, nls);
                 ExtCallOutcome::Value(self.history_state.height)
             }
             6 => {
                 self.pop_ext_args(0);
-                log::debug!(
-                    "[trace-history] history_update active={} pos={} height={}",
-                    self.history_state.active,
-                    self.history_state.scroll_y,
-                    self.history_state.height
-                );
+                // koikake.exe 0x41EF20: hit-test the visible records' body
+                // blocks against the mouse.  Only records carrying a voice
+                // clip react: hovering shows the dark plate and a left click
+                // stops all voice channels (0x431A70) then replays that
+                // record's voice (0x431680).  No right-click/empty handling.
+                let mut clicked_voice = None;
+                if self.history_state.active {
+                    if let Some(input) = input {
+                        let (mouse_x, mouse_y) = input.mouse_position();
+                        let [left, top, right, bottom] = self.history_state.rect;
+                        let mut hovered = None;
+                        if mouse_x >= left && mouse_x < right && mouse_y >= top && mouse_y < bottom
+                        {
+                            let (start, _end, tops) = self.history_visible_window(assets, nls);
+                            let (records, name_block) = {
+                                let cache = self
+                                    .history_state
+                                    .layout_cache
+                                    .as_ref()
+                                    .expect("history_visible_window installs the cache");
+                                (cache.records.clone(), cache.name_block)
+                            };
+                            let rel_y = mouse_y - top;
+                            for (offset, record_top) in tops.iter().enumerate() {
+                                let record = &records[start + offset];
+                                if !record.has_voice || record.body_height == 0 {
+                                    continue;
+                                }
+                                let body_top = *record_top
+                                    + if record.name.is_some() { name_block } else { 0 };
+                                if rel_y >= body_top && rel_y < body_top + record.body_height {
+                                    hovered = Some(start + offset);
+                                    break;
+                                }
+                            }
+                        }
+                        if self.history_state.hovered_record != hovered {
+                            log::debug!("[trace-history] history_update hover={hovered:?}");
+                        }
+                        self.history_state.hovered_record = hovered;
+                        if let Some(record_index) = hovered {
+                            if input.mouse_push(PalMouseButton::Left) {
+                                clicked_voice =
+                                    Some(self.history_state.records[record_index][3]);
+                            }
+                        }
+                    }
+                } else {
+                    self.history_state.hovered_record = None;
+                }
+                if let Some(voice) = clicked_voice {
+                    log::debug!("[trace-history] history_update voice replay value={voice}");
+                    // Native stops all eight voice channels (0x431A70) before
+                    // replaying the record's clip.
+                    if let Some(audio) = audio.as_deref_mut() {
+                        let keys = self
+                            .game_audio
+                            .keys()
+                            .filter(|(category, _)| *category == 13)
+                            .copied()
+                            .collect::<Vec<_>>();
+                        for key in keys {
+                            if let Some(handle) = self.game_audio.remove(&key) {
+                                let _ = audio.release(handle);
+                            }
+                        }
+                    }
+                    self.try_play_text_voice(voice, assets, nls, resource_manager, audio);
+                }
                 ExtCallOutcome::Value(1)
             }
             7 => {
@@ -7357,13 +7683,15 @@ impl ScriptRuntime {
                 // records, i.e. how many of the oldest records do not fit into
                 // the view when it is filled from the newest backward.
                 self.pop_ext_args(0);
-                ExtCallOutcome::Value(self.history_max_scroll_pos())
+                let max_pos = self.history_layout(assets, nls).max_pos;
+                ExtCallOutcome::Value(max_pos)
             }
             9 => {
                 // Native returns ctx+0x5D98: the number of record sprites that
                 // fit in the view.
                 self.pop_ext_args(0);
-                ExtCallOutcome::Value(self.history_visible_capacity() as i32)
+                let visible = self.history_layout(assets, nls).visible_from_bottom;
+                ExtCallOutcome::Value(visible as i32)
             }
             10 => {
                 let args = self.pop_ext_args(4);
@@ -7380,6 +7708,8 @@ impl ScriptRuntime {
             11 => {
                 self.pop_ext_args(0);
                 self.history_state.records.clear();
+                self.history_state.records_generation += 1;
+                self.history_state.layout_cache = None;
                 self.history_state.height = 0;
                 self.history_state.scroll_y = 0;
                 log::debug!("[trace-history] history_clear");
@@ -13058,6 +13388,14 @@ impl ScriptRuntime {
         ) else {
             return ExtCallOutcome::Block;
         };
+        // koikake.exe runs the transition through the same per-frame skip gate
+        // as effect_stop (0x411E0F): an active skip state collapses the fade
+        // to a single frame instead of playing it out.
+        let duration_ms = if self.dispatch_skip_state() != 0 {
+            1
+        } else {
+            duration_ms.max(1)
+        };
         if let Some(sprites) = sprites {
             let transition = *self
                 .game_sprite_transitions
@@ -13319,6 +13657,9 @@ impl ScriptRuntime {
         install_i32_words(&mut self.temp_mem, &snapshot.temp_mem, DEFAULT_MEM_SIZE);
         self.mem_dat_words = snapshot.mem_dat_words;
         self.history_state.records = snapshot.history_records;
+        self.history_state.records_generation += 1;
+        self.history_state.layout_cache = None;
+        self.history_state.hovered_record = None;
         self.text_state.last_text_args = snapshot.text_args;
         self.text_state.last_text_value = snapshot.text_args[1];
         self.text_state.base = snapshot.text_base;
